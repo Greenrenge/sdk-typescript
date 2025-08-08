@@ -20,7 +20,7 @@ export class SpanExporter implements tracing.SpanExporter {
       name: span.name,
       kind: span.kind,
       spanContext: span.spanContext(),
-      parentSpanId: span.parentSpanId,
+      parentSpanId: span.parentSpanContext?.spanId,
       startTime: span.startTime,
       endTime: span.endTime,
       status: span.status,
@@ -32,7 +32,7 @@ export class SpanExporter implements tracing.SpanExporter {
       droppedAttributesCount: span.droppedAttributesCount,
       droppedEventsCount: span.droppedEventsCount,
       droppedLinksCount: span.droppedLinksCount,
-      instrumentationLibrary: span.instrumentationLibrary,
+      instrumentationScope: span.instrumentationScope,
     };
   }
 }

@@ -21,9 +21,12 @@ import {
   WorkflowOutboundCallsInterceptor,
 } from '@temporalio/workflow';
 import { instrument, extractContextFromHeaders, headersWithContext } from '../instrumentation';
-import { ContextManager } from './context-manager';
 import { SpanName, SPAN_DELIMITER } from './definitions';
-import { SpanExporter } from './span-exporter';
+
+import { ContextManager } from './context-manager';
+
+export { ContextManager } from './context-manager';
+export { SpanExporter } from './span-exporter';
 
 export * from './definitions';
 
@@ -36,8 +39,9 @@ function getTracer(): otel.Tracer {
   }
   if (tracer === undefined) {
     const provider = new tracing.BasicTracerProvider();
-    provider.addSpanProcessor(new tracing.SimpleSpanProcessor(new SpanExporter()));
-    provider.register({ contextManager });
+
+    // provider.addSpanProcessor(new tracing.SimpleSpanProcessor(new SpanExporter()));
+    // provider.register({ contextManager });
     tracer = provider.getTracer('@temporalio/interceptor-workflow');
   }
   return tracer;

@@ -1,4 +1,4 @@
-import Long from 'long'; // eslint-disable-line import/no-named-as-default
+import Long from 'long';
 import {
   compilePriority,
   compileRetryPolicy,
@@ -118,7 +118,7 @@ const [encodeDayOfWeek, decodeDayOfWeek] = makeCalendarSpecFieldCoders(
 function makeCalendarSpecFieldCoders<Unit>(
   fieldName: string,
   encodeValueFn: (x: Unit) => number | undefined,
-  decodeValueFn: (x: number) => Unit,
+  decodeValueFn: (x: number) => Unit | undefined,
   defaultValue: temporal.api.schedule.v1.IRange[],
   matchAllValue: temporal.api.schedule.v1.IRange[]
 ) {
@@ -152,6 +152,9 @@ function makeCalendarSpecFieldCoders<Unit>(
     if (!input) return [];
     return (input as temporal.api.schedule.v1.Range[]).map((pb): Range<Unit> => {
       const start = decodeValueFn(pb.start);
+      if (start === undefined) {
+        throw new RangeError(`Invalid CalendarSpec component for field ${fieldName}: ${pb.start} is out of bounds`);
+      }
       const end = pb.end > pb.start ? decodeValueFn(pb.end) ?? start : start;
       const step = pb.step > 0 ? pb.step : 1;
       return { start, end, step };
@@ -264,9 +267,9 @@ export async function encodeScheduleAction(
       retryPolicy: action.retry ? compileRetryPolicy(action.retry) : undefined,
       memo: action.memo ? { fields: await encodeMapToPayloads(dataConverter, action.memo) } : undefined,
       searchAttributes:
-        action.searchAttributes || action.typedSearchAttributes // eslint-disable-line deprecation/deprecation
+        action.searchAttributes || action.typedSearchAttributes // eslint-disable-line @typescript-eslint/no-deprecated
           ? {
-              indexedFields: encodeUnifiedSearchAttributes(action.searchAttributes, action.typedSearchAttributes), // eslint-disable-line deprecation/deprecation
+              indexedFields: encodeUnifiedSearchAttributes(action.searchAttributes, action.typedSearchAttributes), // eslint-disable-line @typescript-eslint/no-deprecated
             }
           : undefined,
       header: { fields: headers },
@@ -324,11 +327,11 @@ export async function decodeScheduleAction(
     const { staticSummary, staticDetails } = await decodeUserMetadata(dataConverter, pb.startWorkflow?.userMetadata);
     return {
       type: 'startWorkflow',
-      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+
       workflowId: pb.startWorkflow.workflowId!,
-      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+
       workflowType: pb.startWorkflow.workflowType!.name!,
-      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+
       taskQueue: pb.startWorkflow.taskQueue!.name!,
       args: await decodeArrayFromPayloads(dataConverter, pb.startWorkflow.input?.payloads),
       memo: await decodeMapFromPayloads(dataConverter, pb.startWorkflow.memo?.fields),
@@ -354,9 +357,8 @@ export function decodeScheduleRunningActions(
     (x): ScheduleExecutionStartWorkflowActionResult => ({
       type: 'startWorkflow',
       workflow: {
-        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
         workflowId: x.workflowId!,
-        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+
         firstExecutionRunId: x.runId!,
       },
     })
@@ -374,9 +376,8 @@ export function decodeScheduleRecentActions(
         action = {
           type: 'startWorkflow',
           workflow: {
-            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
             workflowId: executionResult.startWorkflowResult!.workflowId!,
-            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+
             firstExecutionRunId: executionResult.startWorkflowResult!.runId!,
           },
         };

@@ -9,6 +9,7 @@ import * as helpers from './type-helpers';
 
 export * from './activity-options';
 export { ActivityCancellationDetailsOptions, ActivityCancellationDetails } from './activity-cancellation-details';
+export { SuggestContinueAsNewReason } from './continue-as-new';
 export * from './converter/data-converter';
 export * from './converter/failure-converter';
 export * from './converter/payload-codec';
@@ -30,8 +31,8 @@ export * from './workflow-handle';
 export * from './workflow-options';
 export * from './versioning-intent';
 export {
-  SearchAttributes, // eslint-disable-line deprecation/deprecation
-  SearchAttributeValue, // eslint-disable-line deprecation/deprecation
+  SearchAttributes, // eslint-disable-line @typescript-eslint/no-deprecated
+  SearchAttributeValue, // eslint-disable-line @typescript-eslint/no-deprecated
   SearchAttributeType,
   SearchAttributePair,
   SearchAttributeUpdatePair,

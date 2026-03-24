@@ -21,6 +21,7 @@ import {
   WorkflowExecutionAlreadyStartedError,
 } from '@temporalio/common';
 import { tsToMs } from '@temporalio/common/lib/time';
+import { InjectedSinks } from '@temporalio/worker';
 import pkg from '@temporalio/worker/lib/pkg';
 import { UnsafeWorkflowInfo, WorkflowInfo } from '@temporalio/workflow/lib/interfaces';
 
@@ -36,7 +37,7 @@ import {
 } from '@temporalio/workflow';
 import { configurableHelpers, createTestWorkflowBundle } from './helpers-integration';
 import * as activities from './activities';
-import { cleanOptionalStackTrace, compareStackTrace, u8, Worker } from './helpers';
+import { cleanOptionalStackTrace, compareStackTrace, u8, Worker, isBun } from './helpers';
 import { configMacro, makeTestFn } from './helpers-integration-multi-codec';
 import * as workflows from './workflows';
 
@@ -169,12 +170,18 @@ test.serial('activity-failure with Error', configMacro, async (t, config) => {
     return;
   }
   t.is(err.cause.cause.message, 'Fail me');
-  t.is(
-    cleanOptionalStackTrace(err.cause.cause.stack),
-    dedent`
-  Error: Fail me
-      at throwAnError (test/src/activities/index.ts)
-  `
+  compareStackTrace(
+    t,
+    cleanOptionalStackTrace(err.cause.cause.stack)!,
+    isBun
+      ? dedent`
+    Error: Fail me
+        at throwAnError (test/lib/activities/index.js)
+    `
+      : dedent`
+    Error: Fail me
+        at throwAnError (test/src/activities/index.ts)
+    `
   );
 });
 
@@ -207,10 +214,16 @@ test.serial('activity-failure with ApplicationFailure', configMacro, async (t, c
   compareStackTrace(
     t,
     cleanOptionalStackTrace(err.cause.cause.stack)!,
-    dedent`
-  ApplicationFailure: Fail me
-      at $CLASS.nonRetryable (common/src/failure.ts)
-      at throwAnError (test/src/activities/index.ts)
+    isBun
+      ? dedent`
+    ApplicationFailure: Fail me
+        at nonRetryable (common/lib/failure.js)
+        at throwAnError (test/lib/activities/index.js)
+    `
+      : dedent`
+    ApplicationFailure: Fail me
+        at $CLASS.nonRetryable (common/src/failure.ts)
+        at throwAnError (test/src/activities/index.ts)
     `
   );
 });
@@ -262,11 +275,17 @@ test.serial('child-workflow-failure', configMacro, async (t, config) => {
     compareStackTrace(
       t,
       cleanOptionalStackTrace(err.cause.cause.stack)!,
-      dedent`
-      ApplicationFailure: failure
-          at $CLASS.nonRetryable (common/src/failure.ts)
-          at throwAsync (test/src/workflows/throw-async.ts)
-    `
+      isBun
+        ? dedent`
+        ApplicationFailure: failure
+            at nonRetryable (test/workflow-bundle-$HASH.js)
+            at throwAsync (test/workflow-bundle-$HASH.js)
+      `
+        : dedent`
+        ApplicationFailure: failure
+            at $CLASS.nonRetryable (common/src/failure.ts)
+            at throwAsync (test/src/workflows/throw-async.ts)
+      `
     );
   });
 });
@@ -614,20 +633,20 @@ test.serial('WorkflowHandle.describe result is wrapped', configMacro, async (t, 
   t.deepEqual(execution.type, 'argsAndReturn');
   t.deepEqual(execution.memo, { note: 'foo' });
   t.true(execution.startTime instanceof Date);
-  t.deepEqual(execution.searchAttributes!.CustomKeywordField, ['test-value']); // eslint-disable-line deprecation/deprecation
-  t.deepEqual(execution.searchAttributes!.CustomIntField, [1]); // eslint-disable-line deprecation/deprecation
-  t.deepEqual(execution.searchAttributes!.CustomDatetimeField, [date]); // eslint-disable-line deprecation/deprecation
-  const binSum = execution.searchAttributes!.BinaryChecksums as string[]; // eslint-disable-line deprecation/deprecation
+  t.deepEqual(execution.searchAttributes!.CustomKeywordField, ['test-value']); // eslint-disable-line @typescript-eslint/no-deprecated
+  t.deepEqual(execution.searchAttributes!.CustomIntField, [1]); // eslint-disable-line @typescript-eslint/no-deprecated
+  t.deepEqual(execution.searchAttributes!.CustomDatetimeField, [date]); // eslint-disable-line @typescript-eslint/no-deprecated
+  const binSum = execution.searchAttributes!.BinaryChecksums as string[]; // eslint-disable-line @typescript-eslint/no-deprecated
   if (binSum != null) {
     t.regex(binSum[0], /@temporalio\/worker@/);
   } else {
-    t.deepEqual(execution.searchAttributes!.BuildIds, ['unversioned', `unversioned:${worker.options.buildId}`]); // eslint-disable-line deprecation/deprecation
+    t.deepEqual(execution.searchAttributes!.BuildIds, ['unversioned', `unversioned:${worker.options.buildId}`]); // eslint-disable-line @typescript-eslint/no-deprecated
   }
 });
 
-// eslint-disable-next-line deprecation/deprecation
+// eslint-disable-next-line @typescript-eslint/no-deprecated
 export async function returnSearchAttributes(): Promise<SearchAttributes | undefined> {
-  const sa = workflowInfo().searchAttributes!; // eslint-disable-line @typescript-eslint/no-non-null-assertion, deprecation/deprecation
+  const sa = workflowInfo().searchAttributes!; // eslint-disable-line @typescript-eslint/no-deprecated
   const datetime = (sa.CustomDatetimeField as Array<Date>)[0];
   return {
     ...sa,
@@ -664,7 +683,18 @@ test.serial('Workflow can upsert Search Attributes', configMacro, async (t, conf
   const { env, createWorkerWithDefaults } = config;
   const date = new Date();
   const { startWorkflow } = configurableHelpers(t, t.context.workflowBundle, env);
-  const worker = await createWorkerWithDefaults(t);
+  const worker = await createWorkerWithDefaults(t, {
+    sinks: {
+      customLogger: {
+        info: {
+          fn: async (_info, _message) => {
+            /* we don't need these for this test */
+          },
+          callDuringReplay: false,
+        },
+      },
+    } satisfies InjectedSinks<workflows.CustomLoggerSinks>,
+  });
   const handle = await startWorkflow(workflows.upsertAndReadSearchAttributes, {
     args: [date.getTime()],
   });
@@ -676,7 +706,7 @@ test.serial('Workflow can upsert Search Attributes', configMacro, async (t, conf
     CustomDatetimeField: [date.toISOString()],
     CustomDoubleField: [3.14],
   });
-  const { searchAttributes } = await handle.describe(); // eslint-disable-line deprecation/deprecation
+  const { searchAttributes } = await handle.describe(); // eslint-disable-line @typescript-eslint/no-deprecated
   const { BinaryChecksums, BuildIds, ...rest } = searchAttributes;
   t.deepEqual(rest, {
     CustomBoolField: [true],
@@ -733,16 +763,18 @@ test.serial('Workflow can read WorkflowInfo', configMacro, async (t, config) => 
     workflowId: handle.workflowId,
     historyLength: 3,
     continueAsNewSuggested: false,
+    targetWorkerDeploymentVersionChanged: false,
     // values ignored for the purpose of comparison
     historySize: res.historySize,
     startTime: res.startTime,
     runStartTime: res.runStartTime,
-    currentBuildId: res.currentBuildId, // eslint-disable-line deprecation/deprecation
+    currentBuildId: res.currentBuildId, // eslint-disable-line @typescript-eslint/no-deprecated
     currentDeploymentVersion: res.currentDeploymentVersion,
     // unsafe.now is a function, so doesn't make it through serialization, but .now is required, so we need to cast
-    unsafe: { isReplaying: false } as UnsafeWorkflowInfo,
+    unsafe: { isReplaying: false, isReplayingHistoryEvents: false } as UnsafeWorkflowInfo,
     priority: {},
   });
+  t.is(res.suggestedContinueAsNewReasons, undefined);
 });
 
 /**

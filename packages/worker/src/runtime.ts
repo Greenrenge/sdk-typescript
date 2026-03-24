@@ -4,11 +4,11 @@ import * as os from 'node:os';
 import { native } from '@temporalio/core-bridge';
 import { filterNullAndUndefined } from '@temporalio/common/lib/internal-workflow';
 import { IllegalStateError, Logger, noopMetricMeter, SdkComponent, MetricMeter } from '@temporalio/common';
-import { temporal } from '@temporalio/proto';
+import { coresdk, temporal } from '@temporalio/proto';
 import { History } from '@temporalio/common/lib/proto-utils';
 import { MetricMeterWithComposedTags } from '@temporalio/common/lib/metrics';
 import { isFlushableLogger } from './logger';
-import { RuntimeMetricMeter } from './runtime-metrics';
+import { RuntimeMetricMeter, MetricsBuffer } from './runtime-metrics';
 import { toNativeClientOptions, NativeConnectionOptions } from './connection-options';
 import { byteArrayToBuffer, toMB } from './utils';
 import { CompiledRuntimeOptions, compileOptions, RuntimeOptions } from './runtime-options';
@@ -27,6 +27,13 @@ export class Runtime {
 
   /** The metric meter associated with this runtime. */
   public readonly metricMeter: MetricMeter;
+
+  /**
+   * The metrics buffer associated with this runtime, if buffered metrics are enabled.
+   *
+   * @experimental Buffered metrics is an experimental feature. APIs may be subject to change.
+   */
+  public readonly metricsBuffer: MetricsBuffer | undefined;
 
   /** Track the number of pending creation calls into the tokio runtime to prevent shut down */
   protected pendingCreations = 0;
@@ -50,7 +57,8 @@ export class Runtime {
     public readonly options: CompiledRuntimeOptions
   ) {
     this.logger = options.logger;
-    this.metricMeter = options.telemetryOptions.metricsExporter
+    this.metricsBuffer = options.metricsBuffer?.bind(this);
+    this.metricMeter = options.runtimeOptions.metricsExporter
       ? MetricMeterWithComposedTags.compose(new RuntimeMetricMeter(this.native), {}, true)
       : noopMetricMeter;
 
@@ -97,7 +105,7 @@ export class Runtime {
    */
   protected static create(options: RuntimeOptions, instantiator: 'install' | 'instance'): Runtime {
     const compiledOptions = compileOptions(options);
-    const runtime = native.newRuntime(compiledOptions.telemetryOptions);
+    const runtime = native.newRuntime(compiledOptions.runtimeOptions);
 
     // Remember the provided options in case Core is reinstantiated after being shut down
     this.defaultOptions = options;
@@ -150,7 +158,8 @@ export class Runtime {
   public async registerWorker(client: native.Client, options: native.WorkerOptions): Promise<native.Worker> {
     return await this.createNativeNoBackRef(async () => {
       const worker = native.newWorker(client, options);
-      await native.workerValidate(worker);
+      const buffer = await native.workerValidate(worker);
+      const _namespaceInfo = coresdk.NamespaceInfo.decode(new Uint8Array(buffer));
       this.backRefs.add(worker);
       return worker;
     });
@@ -277,6 +286,10 @@ export class Runtime {
     try {
       if (Runtime._instance === this) delete Runtime._instance;
       (this as any).metricMeter = noopMetricMeter;
+      if (this.metricsBuffer !== undefined) {
+        this.metricsBuffer.unbind(this);
+        (this as any).metricsBuffer = undefined;
+      }
       this.teardownShutdownHook();
       // FIXME(JWH): I think we no longer need this, but will have to thoroughly validate.
       native.runtimeShutdown(this.native);

@@ -455,6 +455,10 @@ export class Activator implements ActivationHandler {
   public versioningBehavior?: VersioningBehavior;
   public workflowDefinitionOptionsGetter?: () => WorkflowDefinitionOptions;
 
+  public readonly workflowSandboxDestructors: (() => void)[] = [];
+
+  protected readonly stackTracesEnabled: boolean;
+
   constructor({
     info,
     now,
@@ -463,6 +467,7 @@ export class Activator implements ActivationHandler {
     getTimeOfDay,
     randomnessSeed,
     registeredActivityNames,
+    stackTracesEnabled,
   }: WorkflowCreateOptionsInternal) {
     this.getTimeOfDay = getTimeOfDay;
     this.info = info;
@@ -471,6 +476,7 @@ export class Activator implements ActivationHandler {
     this.sourceMap = sourceMap;
     this.random = alea(randomnessSeed);
     this.registeredActivityNames = registeredActivityNames;
+    this.stackTracesEnabled = stackTracesEnabled;
   }
 
   /**
@@ -481,6 +487,9 @@ export class Activator implements ActivationHandler {
   }
 
   protected getStackTraces(): Stack[] {
+    if (!this.stackTracesEnabled) {
+      throw new IllegalStateError('Workflow stack traces are not enabled on this worker');
+    }
     const { childToParent, promiseToStack } = this.promiseStackStore;
     const internalNodes = [...childToParent.values()].reduce((acc, curr) => {
       for (const p of curr) {
@@ -856,12 +865,26 @@ export class Activator implements ActivationHandler {
       let input: UpdateInput;
       try {
         if (runValidator && entry.validator) {
-          const validate = composeInterceptors(
-            interceptors,
-            'validateUpdate',
-            this.validateUpdateNextHandler.bind(this, entry.validator)
-          );
-          validate(makeInput());
+          // Temporarily mark as not replaying history events during validator execution
+          // so that logging is permitted. Validators are live read-only operations.
+          const wasReplayingHistoryEvents = this.info.unsafe.isReplayingHistoryEvents;
+          this.mutateWorkflowInfo((info) => ({
+            ...info,
+            unsafe: { ...info.unsafe, isReplayingHistoryEvents: false },
+          }));
+          try {
+            const validate = composeInterceptors(
+              interceptors,
+              'validateUpdate',
+              this.validateUpdateNextHandler.bind(this, entry.validator)
+            );
+            validate(makeInput());
+          } finally {
+            this.mutateWorkflowInfo((info) => ({
+              ...info,
+              unsafe: { ...info.unsafe, isReplayingHistoryEvents: wasReplayingHistoryEvents },
+            }));
+          }
         }
         input = makeInput();
       } catch (error) {
@@ -918,7 +941,7 @@ export class Activator implements ActivationHandler {
           break;
         }
         const [update] = bufferedUpdates.splice(foundIndex, 1);
-        this.doUpdate(update);
+        this.doUpdate(update!);
       }
     }
   }
@@ -928,7 +951,6 @@ export class Activator implements ActivationHandler {
       const update = this.bufferedUpdates.shift();
       if (update) {
         this.rejectUpdate(
-          /* eslint-disable @typescript-eslint/no-non-null-assertion */
           update.protocolInstanceId!,
           ApplicationFailure.nonRetryable(`No registered handler for update: ${update.name}`)
         );
@@ -995,13 +1017,13 @@ export class Activator implements ActivationHandler {
     while (bufferedSignals.length) {
       if (this.defaultSignalHandler) {
         // We have a default signal handler, so all signals are dispatchable
-        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+
         this.signalWorkflow(bufferedSignals.shift()!);
       } else {
         const foundIndex = bufferedSignals.findIndex((signal) => this.signalHandlers.has(signal.signalName as string));
         if (foundIndex === -1) break;
         const [signal] = bufferedSignals.splice(foundIndex, 1);
-        this.signalWorkflow(signal);
+        this.signalWorkflow(signal!);
       }
     }
   }

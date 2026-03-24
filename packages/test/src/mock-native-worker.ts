@@ -1,10 +1,10 @@
-/* eslint-disable @typescript-eslint/no-non-null-assertion */
 import { lastValueFrom } from 'rxjs';
 import { SdkComponent, defaultPayloadConverter, fromPayloadsAtIndex } from '@temporalio/common';
 import { msToTs } from '@temporalio/common/lib/time';
 import { coresdk } from '@temporalio/proto';
 import { DefaultLogger, Runtime, ShutdownError } from '@temporalio/worker';
 import { byteArrayToBuffer } from '@temporalio/worker/lib/utils';
+import { native } from '@temporalio/core-bridge';
 import { NativeReplayHandle, NativeWorkerLike, Worker as RealWorker } from '@temporalio/worker/lib/worker';
 import { LoggerWithComposedMetadata } from '@temporalio/common/lib/logger';
 import { MetricMeterWithComposedTags } from '@temporalio/common/lib/metrics';
@@ -149,6 +149,10 @@ export class MockNativeWorker implements NativeWorkerLike {
     const { taskToken, details } = coresdk.ActivityHeartbeat.decodeDelimited(new Uint8Array(buffer));
     const arg = fromPayloadsAtIndex(defaultPayloadConverter, 0, details);
     this.activityHeartbeatCallback!(taskToken, arg);
+  }
+
+  public replaceClient(_client: native.Client): void {
+    // No-op for mock worker
   }
 
   public async untilHeartbeat(taskToken: Uint8Array): Promise<any> {

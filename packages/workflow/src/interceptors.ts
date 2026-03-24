@@ -15,7 +15,8 @@ import {
   WorkflowExecution,
 } from '@temporalio/common';
 import type { coresdk } from '@temporalio/proto';
-import { ChildWorkflowOptionsWithDefaults, ContinueAsNewOptions } from './interfaces';
+import type { ChildWorkflowOptionsWithDefaults, ContinueAsNewOptions } from './interfaces';
+import type { NexusOperationCancellationType } from './nexus';
 
 export { Next, Headers };
 
@@ -287,6 +288,38 @@ export interface StartNexusOperationOptions {
    * Optional: defaults to the maximum allowed by the Temporal server.
    */
   readonly scheduleToCloseTimeout?: Duration;
+
+  /**
+   * How long the operation may wait before it begins executing. If the operation has not started
+   * within this window, a timeout error with type SCHEDULE_TO_START is raised.
+   *
+   * Optional: defaults to no timeout.
+   */
+  readonly scheduleToStartTimeout?: Duration;
+
+  /**
+   * How long an async operation may take to complete after it has started. If the operation does
+   * not complete within this window, a timeout error with type START_TO_CLOSE is raised.
+   *
+   * Optional: defaults to no timeout.
+   */
+  readonly startToCloseTimeout?: Duration;
+
+  /**
+   * Determines:
+   * - whether cancellation requests should be propagated from the Workflow to the Nexus Operation
+   * - whether and when should the Operation's cancellation be reported back to the Workflow
+   *   (i.e. at which moment should the operation's result promise fail with a `NexusOperationFailure`,
+   *   with `cause` set to a `CancelledFailure`).
+   *
+   * Note that this setting only applies to cancellation originating from an external request for the
+   * Workflow itself, or from internal cancellation of the `CancellationScope` in which the
+   * Operation call was made.
+   *
+   * @default WAIT_CANCELLATION_COMPLETED
+   */
+  // MAINTENANCE: Keep this typedoc in sync with the `NexusOperationCancellationType` enum
+  readonly cancellationType?: NexusOperationCancellationType;
 
   /**
    * A fixed, single-line summary for this Nexus Operation that may appear in the UI/CLI.

@@ -62,6 +62,7 @@ import { Client } from '@temporalio/client';
 import { coresdk, temporal } from '@temporalio/proto';
 import { type SinkCall, type WorkflowInfo } from '@temporalio/workflow';
 import { throwIfReservedName } from '@temporalio/common/lib/reserved';
+import { suggestContinueAsNewReasonsFromProto } from '@temporalio/common/lib/continue-as-new';
 import { Activity, CancelReason, activityLogAttributes } from './activity';
 import { extractNativeClient, extractReferenceHolders, InternalNativeConnection, NativeConnection } from './connection';
 import { ActivityExecuteInput } from './interceptors';
@@ -162,6 +163,7 @@ export interface NativeWorkerLike {
   completeActivityTask: OmitFirstParam<typeof native.workerCompleteActivityTask>;
   completeNexusTask: OmitFirstParam<typeof native.workerCompleteNexusTask>;
   recordActivityHeartbeat: OmitFirstParam<typeof native.workerRecordActivityHeartbeat>;
+  replaceClient: OmitFirstParam<typeof native.workerReplaceClient>;
 }
 
 export interface NativeReplayHandle {
@@ -184,7 +186,7 @@ interface WorkflowWithLogAttributes {
 }
 
 function addBuildIdIfMissing(options: CompiledWorkerOptions, bundleCode?: string): CompiledWorkerOptionsWithBuildId {
-  const bid = options.buildId; // eslint-disable-line deprecation/deprecation
+  const bid = options.buildId; // eslint-disable-line @typescript-eslint/no-deprecated
   if (bid != null) {
     return options as CompiledWorkerOptionsWithBuildId;
   }
@@ -194,6 +196,7 @@ function addBuildIdIfMissing(options: CompiledWorkerOptions, bundleCode?: string
 
 export class NativeWorker implements NativeWorkerLike {
   public readonly type = 'worker';
+  public readonly replaceClient: OmitFirstParam<typeof native.workerReplaceClient>;
   public readonly pollWorkflowActivation: OmitFirstParam<typeof native.workerPollWorkflowActivation>;
   public readonly pollActivityTask: OmitFirstParam<typeof native.workerPollActivityTask>;
   public readonly pollNexusTask: OmitFirstParam<typeof native.workerPollNexusTask>;
@@ -227,6 +230,7 @@ export class NativeWorker implements NativeWorkerLike {
     protected readonly runtime: Runtime,
     protected readonly nativeWorker: native.Worker
   ) {
+    this.replaceClient = native.workerReplaceClient.bind(undefined, nativeWorker);
     this.pollWorkflowActivation = native.workerPollWorkflowActivation.bind(undefined, nativeWorker);
     this.pollActivityTask = native.workerPollActivityTask.bind(undefined, nativeWorker);
     this.pollNexusTask = native.workerPollNexusTask.bind(undefined, nativeWorker);
@@ -474,7 +478,7 @@ export class Worker {
    */
   protected hasOutstandingNexusPoll = false;
 
-  protected client?: Client;
+  protected _client?: Client;
 
   protected readonly numInFlightActivationsSubject = new BehaviorSubject<number>(0);
   protected readonly numInFlightActivitiesSubject = new BehaviorSubject<number>(0);
@@ -818,20 +822,10 @@ export class Worker {
     protected readonly logger: Logger,
     protected readonly metricMeter: MetricMeter,
     protected readonly plugins: WorkerPlugin[],
-    protected readonly connection?: NativeConnection,
+    protected _connection?: NativeConnection,
     protected readonly isReplayWorker: boolean = false
   ) {
     this.workflowCodecRunner = new WorkflowCodecRunner(options.loadedDataConverter.payloadCodecs);
-    if (connection != null) {
-      // connection (and consequently client) will be set IIF this is not a replay worker.
-      this.client = new Client({
-        namespace: options.namespace,
-        connection,
-        identity: options.identity,
-        dataConverter: options.dataConverter,
-        interceptors: options.interceptors.client,
-      });
-    }
   }
 
   /**
@@ -880,6 +874,72 @@ export class Worker {
       numInFlightNonLocalActivities: this.numInFlightNonLocalActivitiesSubject.value,
       numInFlightLocalActivities: this.numInFlightLocalActivitiesSubject.value,
     };
+  }
+
+  /**
+   * Get the client associated with this Worker.
+   *
+   * Returns undefined if the worker was created without a connection (e.g., replay workers).
+   */
+  public get client(): Client | undefined {
+    // Lazily create the client if it's not already set. Note that _connection
+    // (and consequently _client) will be set IIF this is not a replay worker.
+    if (this._client == null && this._connection != null) {
+      this._client = new Client({
+        namespace: this.options.namespace,
+        connection: this._connection,
+        identity: this.options.identity,
+        dataConverter: this.options.dataConverter,
+        interceptors: this.options.interceptors.client,
+      });
+    }
+
+    return this._client;
+  }
+
+  /**
+   * Get the connection associated with this Worker.
+   * Returns undefined if the worker was created without a connection (e.g., replay workers).
+   */
+  public get connection(): NativeConnection | undefined {
+    return this._connection;
+  }
+
+  /**
+   * Replace the connection used by this Worker.
+   * This allows the worker to switch to a different Temporal server or update connection configuration
+   * without restarting the worker.
+   *
+   * @remarks
+   * The worker must have been created with a connection for this method to work.
+   * Subsequent calls by the worker to Temporal (e.g., responding to tasks) will use the new connection.
+   * A new client will be created automatically from the provided connection.
+   *
+   * @param newConnection - The new NativeConnection to use
+   * @throws {IllegalStateError} If the worker was created without a connection
+   * @throws {Error} If the connection replacement fails
+   */
+  public set connection(newConnection: NativeConnection) {
+    if (!this._connection) throw new IllegalStateError('Cannot replace connection on a worker without a connection');
+    if (extractNativeClient(this._connection) === extractNativeClient(newConnection)) return;
+
+    const previousConnection = this._connection;
+
+    // Call the native bridge to replace the client
+    this.nativeWorker.replaceClient(extractNativeClient(newConnection));
+
+    extractReferenceHolders(previousConnection).delete(this.nativeWorker);
+    this._connection = newConnection;
+    extractReferenceHolders(newConnection).add(this.nativeWorker);
+
+    // Clear up the cached client, if any. It will be lazily recreated on demand.
+    this._client = undefined;
+
+    if (previousConnection instanceof InternalNativeConnection) {
+      previousConnection.close().catch((err) => {
+        this.logger.error('Error closing previous connection after replacement of worker connection', { err });
+      });
+    }
   }
 
   protected get state(): State {
@@ -1347,7 +1407,7 @@ export class Worker {
       const close = removeFromCacheIx !== -1;
       const jobs = activation.jobs;
       if (close) {
-        const asEvictJob = jobs.splice(removeFromCacheIx, 1)[0].removeFromCache;
+        const asEvictJob = jobs.splice(removeFromCacheIx, 1)[0]!.removeFromCache;
         if (asEvictJob) {
           this.evictionsEmitter.emit('eviction', {
             runId: activation.runId,
@@ -1400,12 +1460,10 @@ export class Worker {
           // When processing workflows through runReplayHistories, Core may still send non-replay
           // activations on the very last Workflow Task in some cases. Though Core is technically exact
           // here, the fact that sinks marked with callDuringReplay = false may get called on a replay
-          // worker is definitely a surprising behavior. For that reason, we extend the isReplaying flag in
-          // this case to also include anything running under in a replay worker.
-          const isReplaying = activation.isReplaying || this.isReplayWorker;
-
+          // worker is definitely a surprising behavior. For that reason, processSinkCalls checks
+          // this.isReplayWorker to suppress all non-callDuringReplay sinks on replay workers.
           const calls = await workflow.workflow.getAndResetSinkCalls();
-          await this.processSinkCalls(calls, isReplaying, workflow.logAttributes);
+          await this.processSinkCalls(calls, workflow.logAttributes);
         }
         this.logger.trace('Completed activation', workflow.logAttributes);
       }
@@ -1442,7 +1500,6 @@ export class Worker {
     activation: Decoded<coresdk.workflow_activation.WorkflowActivation>,
     initWorkflowJob: Decoded<coresdk.workflow_activation.IInitializeWorkflow>
   ): Promise<WorkflowWithLogAttributes> {
-    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
     const workflowCreator = this.workflowCreator!;
     if (
       !(
@@ -1508,11 +1565,14 @@ export class Worker {
       // A zero value means that it was not set by the server
       historySize: activation.historySizeBytes.toNumber(),
       continueAsNewSuggested: activation.continueAsNewSuggested,
+      targetWorkerDeploymentVersionChanged: activation.targetWorkerDeploymentVersionChanged ?? false,
+      suggestedContinueAsNewReasons: suggestContinueAsNewReasonsFromProto(activation.suggestContinueAsNewReasons),
       currentBuildId: activation.deploymentVersionForCurrentTask?.buildId ?? '',
       currentDeploymentVersion: convertDeploymentVersion(activation.deploymentVersionForCurrentTask),
       unsafe: {
         now: () => Date.now(), // re-set in initRuntime
         isReplaying: activation.isReplaying,
+        isReplayingHistoryEvents: activation.isReplaying,
       },
       priority: decodePriority(priority),
     };
@@ -1538,11 +1598,7 @@ export class Worker {
    * This function does not throw, it will log in case of missing sinks
    * or failed sink function invocations.
    */
-  protected async processSinkCalls(
-    externalCalls: SinkCall[],
-    isReplaying: boolean,
-    logAttributes: Record<string, unknown>
-  ): Promise<void> {
+  protected async processSinkCalls(externalCalls: SinkCall[], logAttributes: Record<string, unknown>): Promise<void> {
     const { sinks } = this.options;
 
     const filteredCalls = externalCalls
@@ -1560,8 +1616,15 @@ export class Worker {
         });
         return false;
       })
-      // If appropriate, reject calls to sink functions not configured with `callDuringReplay = true`
-      .filter(({ sink }) => sink?.callDuringReplay || !isReplaying);
+      // If appropriate, reject calls to sink functions not configured with `callDuringReplay = true`.
+      // Use per-call isReplayingHistoryEvents (which is false during queries and update validators)
+      // rather than per-activation isReplaying, so that logging is permitted during live read-only operations.
+      // Replay workers still suppress all non-callDuringReplay sinks regardless.
+      .filter(({ call, sink }) => {
+        if (sink?.callDuringReplay) return true;
+        if (this.isReplayWorker) return false;
+        return !call.workflowInfo.unsafe.isReplayingHistoryEvents;
+      });
 
     // Make a wrapper function, to make things easier afterward
     await Promise.all(
@@ -1989,7 +2052,7 @@ export class Worker {
     for (let i = this.plugins.length - 1; i >= 0; --i) {
       const rw = runWorker;
       const plugin = this.plugins[i];
-      if (plugin.runWorker !== undefined) {
+      if (plugin?.runWorker !== undefined) {
         runWorker = (w: Worker) => plugin.runWorker!(w, rw);
       }
     }
@@ -2063,11 +2126,11 @@ export class Worker {
       unexpectedErrorSubscription.unsubscribe();
       try {
         // Only exists in non-replay Worker
-        if (this.connection) {
-          extractReferenceHolders(this.connection).delete(this.nativeWorker);
+        if (this._connection) {
+          extractReferenceHolders(this._connection).delete(this.nativeWorker);
           // Only close if this worker is the creator of the connection
-          if (this.connection instanceof InternalNativeConnection) {
-            await this.connection.close();
+          if (this._connection instanceof InternalNativeConnection) {
+            await this._connection.close();
           }
         }
         await this.workflowCreator?.destroy();
@@ -2116,7 +2179,7 @@ export function parseWorkflowCode(code: string, codePath?: string): WorkflowBund
   return { code, sourceMap, filename };
 }
 
-function extractSourceMap(code: string) {
+function extractSourceMap(code: string): [string, string] {
   const sourceMapCommentPos = code.lastIndexOf('//# sourceMappingURL=data:');
   if (sourceMapCommentPos > 0) {
     const base64TagIndex = code.indexOf('base64,', sourceMapCommentPos);

@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-non-null-assertion */
 import anyTest, { ExecutionContext, TestFn } from 'ava';
 import dedent from 'dedent';
 import { v4 as uuid4 } from 'uuid';
@@ -6,7 +5,7 @@ import { TemporalFailure, defaultPayloadConverter, toPayloads, ApplicationFailur
 import { coresdk, google } from '@temporalio/proto';
 import { msToTs } from '@temporalio/common/lib/time';
 import { httpGet } from './activities';
-import { cleanOptionalStackTrace } from './helpers';
+import { cleanOptionalStackTrace, isBun } from './helpers';
 import { defaultOptions, isolateFreeWorker, Worker } from './mock-native-worker';
 import { withZeroesHTTPServer } from './zeroes-http-server';
 import Duration = google.protobuf.Duration;
@@ -88,7 +87,11 @@ test('Worker runs an activity and reports failure', async (t) => {
         failure: {
           message,
           source: 'TypeScriptSDK',
-          stackTrace: dedent`
+          stackTrace: isBun
+            ? dedent`
+            Error: :(
+                at throwAnError (test/lib/activities/index.js)`
+            : dedent`
             Error: :(
                 at throwAnError (test/src/activities/index.ts)
           `,
@@ -157,7 +160,7 @@ test('Activity Context AbortSignal cancels a fetch request', async (t) => {
         },
       });
       compareCompletion(t, completion.result, {
-        cancelled: { failure: { source: 'TypeScriptSDK', canceledFailureInfo: {} } },
+        cancelled: { failure: { source: 'TypeScriptSDK', message: 'CANCELLED', canceledFailureInfo: {} } },
       });
     });
   });
@@ -185,7 +188,7 @@ test('Activity cancel with reason "NOT_FOUND" is valid', async (t) => {
         },
       });
       compareCompletion(t, completion.result, {
-        cancelled: { failure: { source: 'TypeScriptSDK', canceledFailureInfo: {} } },
+        cancelled: { failure: { source: 'TypeScriptSDK', message: 'NOT_FOUND', canceledFailureInfo: {} } },
       });
     });
   });

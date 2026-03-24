@@ -1,11 +1,12 @@
 import v8 from 'node:v8';
 import vm from 'node:vm';
-import { AsyncLocalStorage } from 'node:async_hooks';
+import { AsyncLocalStorage as AsyncLocalStorageOriginal } from 'node:async_hooks';
 import assert from 'node:assert';
 import { URL, URLSearchParams } from 'node:url';
 import { TextDecoder, TextEncoder } from 'node:util';
 import { SourceMapConsumer } from 'source-map';
 import { cutoffStackTrace, IllegalStateError } from '@temporalio/common';
+import { suggestContinueAsNewReasonsFromProto } from '@temporalio/common/lib/continue-as-new';
 import { tsToMs } from '@temporalio/common/lib/time';
 import { coresdk } from '@temporalio/proto';
 import type { StackTraceFileLocation } from '@temporalio/workflow';
@@ -17,6 +18,10 @@ import { UnhandledRejectionError } from '../errors';
 import { convertDeploymentVersion } from '../utils';
 import { Workflow } from './interface';
 import { WorkflowBundleWithSourceMapAndFilename } from './workflow-worker-thread/input';
+
+// We need this import for the ambient global extensions
+import '@temporalio/workflow/lib/global-attributes'; // eslint-disable-line import/no-unassigned-import
+import { isBun } from './bun';
 
 // Best effort to catch unhandled rejections from workflow code.
 // We crash the thread if we cannot find the culprit.
@@ -45,7 +50,7 @@ export function setUnhandledRejectionHandler(getWorkflowByRunId: (runId: string)
  */
 function cutoffStructuredStackTrace(stackTrace: StackTraceFileLocation[]): void {
   stackTrace.shift();
-  if (stackTrace[0].function_name === 'initAll' && stackTrace[0].file_path === 'node:internal/promise_hooks') {
+  if (stackTrace[0]?.function_name === 'initAll' && stackTrace[0].file_path === 'node:internal/promise_hooks') {
     stackTrace.shift();
   }
   const idx = stackTrace.findIndex(({ function_name, file_path }) => {
@@ -89,8 +94,9 @@ function formatCallsiteName(callsite: NodeJS.CallSite): string | null {
  * Inject global objects as well as console.[log|...] into a vm context.
  */
 export function injectGlobals(context: vm.Context): void {
+  const sandboxGlobalThis = context as typeof globalThis;
+
   const globals = {
-    AsyncLocalStorage,
     URL,
     URLSearchParams,
     assert,
@@ -99,24 +105,60 @@ export function injectGlobals(context: vm.Context): void {
     AbortController,
   };
   for (const [k, v] of Object.entries(globals)) {
-    Object.defineProperty(context, k, { value: v, writable: false, enumerable: true, configurable: false });
+    Object.defineProperty(sandboxGlobalThis, k, { value: v, writable: false, enumerable: true, configurable: false });
   }
 
   const consoleMethods = ['log', 'warn', 'error', 'info', 'debug'] as const;
   type ConsoleMethod = (typeof consoleMethods)[number];
   function makeConsoleFn(level: ConsoleMethod) {
     return function (...args: unknown[]) {
-      const { info } = context.__TEMPORAL_ACTIVATOR__;
-      if (info.isReplaying) return;
-      console[level](`[${info.workflowType}(${info.workflowId})]`, ...args);
+      if (sandboxGlobalThis.__TEMPORAL_ACTIVATOR__ === undefined) {
+        // This should not happen in a normal execution environment, but this is
+        // often handy while debugging the SDK, and costs nothing to keep around.
+        console[level](`[not in workflow context]`, ...args);
+      } else {
+        const { info } = sandboxGlobalThis.__TEMPORAL_ACTIVATOR__!;
+        if (info.unsafe.isReplayingHistoryEvents) return;
+        console[level](`[${info.workflowType}(${info.workflowId})]`, ...args);
+      }
     };
   }
   const consoleObject = Object.fromEntries(consoleMethods.map((level) => [level, makeConsoleFn(level)]));
-  Object.defineProperty(context, 'console', {
+  Object.defineProperty(sandboxGlobalThis, 'console', {
     value: consoleObject,
     writable: true,
     enumerable: false,
     configurable: true,
+  });
+
+  class AsyncLocalStorage extends AsyncLocalStorageOriginal<any> {
+    constructor(private name: string = 'anonymous') {
+      super();
+
+      const activator = sandboxGlobalThis.__TEMPORAL_ACTIVATOR__;
+      if (activator) {
+        activator.workflowSandboxDestructors.push(this.disable.bind(this));
+      } else {
+        if (sandboxGlobalThis.__temporal_globalSandboxDestructors === undefined)
+          Object.defineProperty(sandboxGlobalThis, '__temporal_globalSandboxDestructors', {
+            value: [],
+            writable: false,
+            enumerable: false,
+            configurable: false,
+          });
+        sandboxGlobalThis.__temporal_globalSandboxDestructors!.push(this.disable.bind(this));
+      }
+    }
+
+    disable(): void {
+      super.disable();
+    }
+  }
+  Object.defineProperty(sandboxGlobalThis, 'AsyncLocalStorage', {
+    value: AsyncLocalStorage,
+    writable: false,
+    enumerable: true,
+    configurable: false,
   });
 }
 
@@ -128,6 +170,7 @@ export class GlobalHandlers {
   bundleFilenameToSourceMapConsumer = new Map<string, SourceMapConsumer>();
   origPrepareStackTrace = Error.prepareStackTrace;
   private stopPromiseHook = () => {};
+  promiseHookInstalled = false;
   installed = false;
 
   async addWorkflowBundle(workflowBundle: WorkflowBundleWithSourceMapAndFilename): Promise<void> {
@@ -256,7 +299,7 @@ export class GlobalHandlers {
           ) {
             // Skip internal promises created by the aggregator and link directly.
             promise = currentAggregation;
-            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+
             stackTrace = store.promiseToStack.get(currentAggregation)!; // Must exist
           } else if (/^\s+at (Function|Promise)\.(race|all|allSettled|any) \(<anonymous>\)\n/.test(formatted)) {
             currentAggregation = promise;
@@ -284,6 +327,7 @@ export class GlobalHandlers {
           store.promiseToStack.delete(promise);
         },
       }) as () => void;
+      this.promiseHookInstalled = true;
     } catch (_) {
       // v8.promiseHooks.createHook is not available in bun and Node.js < 16.14.0.
       // That's ok, collecting stack trace is an optional feature anyway.
@@ -320,13 +364,17 @@ export abstract class BaseVMWorkflow implements Workflow {
 
   /**
    * Send request to the Workflow runtime's worker-interface
+   *
+   * In order to properly work around Bun's lack of support for `microtaskMode: afterEvaluate` it is important to
+   * immediately schedule a task after each call into the `workflowModule`. This task ensures that any microtasks
+   * from a specific workflow will execute while the vm is still setup for said workflow.
+   * This is why there are `if (isBun) await new Promise(setImmediate)` scattered throughout this function.
    */
   public async activate(
     activation: coresdk.workflow_activation.IWorkflowActivation
   ): Promise<coresdk.workflow_completion.IWorkflowActivationCompletion> {
     try {
       if (this.context === undefined) throw new IllegalStateError('Workflow isolate context uninitialized');
-      activation = coresdk.workflow_activation.WorkflowActivation.fromObject(activation);
       if (!activation.jobs) throw new TypeError('Expected workflow activation jobs to be defined');
 
       // Queries are particular in many ways, and Core guarantees that a single activation will not
@@ -349,11 +397,14 @@ export abstract class BaseVMWorkflow implements Workflow {
         // historySize === 0 means WFT was generated by pre-1.20.0 server, and the history size is unknown
         historySize: activation.historySizeBytes?.toNumber() ?? 0,
         continueAsNewSuggested: activation.continueAsNewSuggested ?? false,
+        targetWorkerDeploymentVersionChanged: activation.targetWorkerDeploymentVersionChanged ?? false,
+        suggestedContinueAsNewReasons: suggestContinueAsNewReasonsFromProto(activation.suggestContinueAsNewReasons),
         currentBuildId: activation.deploymentVersionForCurrentTask?.buildId ?? '',
         currentDeploymentVersion: convertDeploymentVersion(activation.deploymentVersionForCurrentTask),
         unsafe: {
           ...info.unsafe,
           isReplaying: activation.isReplaying ?? false,
+          isReplayingHistoryEvents: activation.isReplaying ?? false,
         },
       }));
       this.activator.addKnownFlags(activation.availableInternalFlags ?? []);
@@ -362,7 +413,10 @@ export abstract class BaseVMWorkflow implements Workflow {
       // Initialization of the workflow must happen before anything else. Yet, keep the init job in
       // place in the list as we'll use it as a marker to know when to start the workflow function.
       const initWorkflowJob = activation.jobs.find((job) => job.initializeWorkflow != null)?.initializeWorkflow;
-      if (initWorkflowJob) this.workflowModule.initialize(initWorkflowJob);
+      if (initWorkflowJob) {
+        this.workflowModule.initialize(initWorkflowJob);
+        if (isBun) await new Promise(setImmediate);
+      }
 
       const hasSignals = activation.jobs.some(({ signalWorkflow }) => signalWorkflow != null);
       const doSingleBatch = !hasSignals || this.activator.hasFlag(SdkFlags.ProcessWorkflowActivationJobsAsSingleBatch);
@@ -379,11 +433,15 @@ export abstract class BaseVMWorkflow implements Workflow {
         // they were handled as regular jobs, making it unsafe to properly handle that job above, with patches.
         const [updateRandomSeed, rest] = partition(nonPatches, ({ updateRandomSeed }) => updateRandomSeed != null);
         if (updateRandomSeed.length > 0)
-          this.activator.updateRandomSeed(updateRandomSeed[updateRandomSeed.length - 1].updateRandomSeed!);
+          this.activator.updateRandomSeed(updateRandomSeed[updateRandomSeed.length - 1]!.updateRandomSeed!);
         this.workflowModule.activate(
           coresdk.workflow_activation.WorkflowActivation.fromObject({ ...activation, jobs: rest })
         );
-        this.tryUnblockConditionsAndMicrotasks();
+        if (isBun) {
+          await this.tryUnblockConditionsAndMicrotasksWithManualFlush();
+        } else {
+          this.tryUnblockConditionsAndMicrotasks();
+        }
       } else {
         const [signals, nonSignals] = partition(
           nonPatches,
@@ -399,10 +457,15 @@ export abstract class BaseVMWorkflow implements Workflow {
             coresdk.workflow_activation.WorkflowActivation.fromObject({ ...activation, jobs }),
             batchIndex++
           );
-          this.tryUnblockConditionsAndMicrotasks();
+          if (isBun) {
+            await this.tryUnblockConditionsAndMicrotasksWithManualFlush();
+          } else {
+            this.tryUnblockConditionsAndMicrotasks();
+          }
         }
       }
 
+      if (isBun) await new Promise(setImmediate);
       const completion = this.workflowModule.concludeActivation();
 
       // Give unhandledRejection handler a chance to be triggered.
@@ -422,18 +485,23 @@ export abstract class BaseVMWorkflow implements Workflow {
     }
   }
 
-  private activateQueries(
+  private async activateQueries(
     activation: coresdk.workflow_activation.IWorkflowActivation
-  ): coresdk.workflow_completion.IWorkflowActivationCompletion {
+  ): Promise<coresdk.workflow_completion.IWorkflowActivationCompletion> {
     this.activator.mutateWorkflowInfo((info) => ({
       ...info,
       unsafe: {
         ...info.unsafe,
         isReplaying: true,
+        // Queries are live read-only operations, not replay of history events
+        isReplayingHistoryEvents: false,
       },
     }));
     this.workflowModule.activate(activation);
-    return this.workflowModule.concludeActivation();
+    if (isBun) await new Promise(setImmediate);
+    const completion = this.workflowModule.concludeActivation();
+    if (isBun) await new Promise(setImmediate);
+    return completion;
   }
 
   /**
@@ -459,6 +527,20 @@ export abstract class BaseVMWorkflow implements Workflow {
    */
   protected tryUnblockConditionsAndMicrotasks(): void {
     for (;;) {
+      const numUnblocked = this.workflowModule.tryUnblockConditions();
+      if (numUnblocked === 0) break;
+    }
+  }
+
+  /**
+   * Same as `tryUnblockConditionsAndMicrotasks`, but not relying on `microtaskMode: afterEvaluate`.
+   *
+   * Instead of relying on microtasks being flushed by `microtaskMode`, await a `Promise` to give a chance for
+   * the microtasks to settle.
+   */
+  protected async tryUnblockConditionsAndMicrotasksWithManualFlush(): Promise<void> {
+    for (;;) {
+      await new Promise(setImmediate);
       const numUnblocked = this.workflowModule.tryUnblockConditions();
       if (numUnblocked === 0) break;
     }

@@ -71,8 +71,7 @@ export interface WorkerOptions {
    *
    * @default `@temporalio/worker` package name and version + checksum of workflow bundle's code
    *
-   * @experimental The Worker Versioning API is still being designed. Major changes are expected.
-   * @deprecated Use {@link workerDeploymentOptions} instead.
+   * @deprecated Worker Versioning is now deprecated. Use {@link workerDeploymentOptions} instead: https://docs.temporal.io/worker-deployments
    */
   buildId?: string;
 
@@ -83,15 +82,12 @@ export interface WorkerOptions {
    *
    * For more information, see https://docs.temporal.io/workers#worker-versioning
    *
-   * @experimental The Worker Versioning API is still being designed. Major changes are expected.
-   * @deprecated Use {@link workerDeploymentOptions} instead.
+   * @deprecated Worker Versioning is now deprecated. Use {@link workerDeploymentOptions} instead: https://docs.temporal.io/worker-deployments
    */
   useVersioning?: boolean;
 
   /**
    * Deployment options for the worker. Exclusive with `build_id` and `use_worker_versioning`.
-   *
-   * @experimental Deployment based versioning is still experimental.
    */
   workerDeploymentOptions?: WorkerDeploymentOptions;
 
@@ -632,8 +628,6 @@ export interface PollerBehaviorSimpleMaximum {
 /**
  * Allows specifying the deployment version of the worker and whether to use deployment-based
  * worker versioning.
- *
- * @experimental Deployment based versioning is still experimental.
  */
 export type WorkerDeploymentOptions = {
   /**
@@ -647,11 +641,21 @@ export type WorkerDeploymentOptions = {
   useWorkerVersioning: boolean;
 
   /**
-   * The default versioning behavior to use for all workflows on this worker. Specifying a default
-   * behavior is required.
+   * The default versioning behavior to use for all workflows on this worker.
+   *
+   * Required if {@link useWorkerVersioning} is `true`; should be left unset otherwise.
    */
-  defaultVersioningBehavior: VersioningBehavior;
-};
+  defaultVersioningBehavior?: VersioningBehavior | undefined;
+} & (
+  | {
+      useWorkerVersioning: true;
+      defaultVersioningBehavior: VersioningBehavior;
+    }
+  | {
+      useWorkerVersioning: false;
+      defaultVersioningBehavior?: never;
+    }
+);
 
 // Replay Worker ///////////////////////////////////////////////////////////////////////////////////
 
@@ -724,7 +728,7 @@ export type WorkflowBundleOption =
   | WorkflowBundle
   | WorkflowBundleWithSourceMap
   | WorkflowBundlePath
-  | WorkflowBundlePathWithSourceMap; // eslint-disable-line deprecation/deprecation
+  | WorkflowBundlePathWithSourceMap; // eslint-disable-line @typescript-eslint/no-deprecated
 
 export function isCodeBundleOption(bundleOpt: WorkflowBundleOption): bundleOpt is WorkflowBundle {
   const opt = bundleOpt as any; // Cast to access properties without TS complaining
@@ -745,7 +749,7 @@ export function isPathBundleOption(bundleOpt: WorkflowBundleOption): bundleOpt i
  * @deprecated Calling `defaultSink()` is no longer required. To configure a custom logger, set the
  *             {@link Runtime.logger} property instead.
  */
-// eslint-disable-next-line deprecation/deprecation
+// eslint-disable-next-line @typescript-eslint/no-deprecated
 export function defaultSinks(logger?: Logger): InjectedSinks<LoggerSinks> {
   // initLoggerSink() returns a sink that complies to the new LoggerSinksInternal API (ie. named __temporal_logger), but
   // code that is still calling defaultSinks() expects return type to match the deprecated LoggerSinks API. Silently
@@ -755,12 +759,12 @@ export function defaultSinks(logger?: Logger): InjectedSinks<LoggerSinks> {
   // If no logger was provided, the legacy behavior was to _lazily_ set the sink's logger to the Runtime's logger.
   // This was required because we may call defaultSinks() before the Runtime is initialized. We preserve that behavior
   // here by silently not initializing the sink if no logger is provided.
-  // eslint-disable-next-line deprecation/deprecation
+  // eslint-disable-next-line @typescript-eslint/no-deprecated
   if (!logger) return {} as InjectedSinks<LoggerSinks>;
 
   // Register the logger sink with its historical name
   const { __temporal_logger: defaultWorkerLogger } = initLoggerSink(logger);
-  return { defaultWorkerLogger } satisfies InjectedSinks<LoggerSinks>; // eslint-disable-line deprecation/deprecation
+  return { defaultWorkerLogger } satisfies InjectedSinks<LoggerSinks>; // eslint-disable-line @typescript-eslint/no-deprecated
 }
 
 /**
@@ -779,9 +783,9 @@ export function appendDefaultInterceptors(
 
   return {
     activityInbound: [
-      // eslint-disable-next-line deprecation/deprecation
+      // eslint-disable-next-line @typescript-eslint/no-deprecated
       (ctx) => new ActivityInboundLogInterceptor(ctx, logger),
-      // eslint-disable-next-line deprecation/deprecation
+      // eslint-disable-next-line @typescript-eslint/no-deprecated
       ...(interceptors.activityInbound ?? []),
     ],
     activity: interceptors.activity,
@@ -792,7 +796,7 @@ export function appendDefaultInterceptors(
 function compileWorkerInterceptors({
   client,
   activity,
-  activityInbound, // eslint-disable-line deprecation/deprecation
+  activityInbound, // eslint-disable-line @typescript-eslint/no-deprecated
   nexus,
   workflowModules,
 }: Required<WorkerInterceptors>): CompiledWorkerInterceptors {
@@ -879,8 +883,8 @@ function addDefaultWorkerOptions(
   metricMeter: MetricMeter
 ): WorkerOptionsWithDefaults {
   const {
-    buildId, // eslint-disable-line deprecation/deprecation
-    useVersioning, // eslint-disable-line deprecation/deprecation
+    buildId, // eslint-disable-line @typescript-eslint/no-deprecated
+    useVersioning, // eslint-disable-line @typescript-eslint/no-deprecated
     maxCachedWorkflows,
     showStackTraceSources,
     namespace,
@@ -995,7 +999,7 @@ function addDefaultWorkerOptions(
       },
       activity: interceptors?.activity ?? [],
       nexus: interceptors?.nexus ?? [],
-      // eslint-disable-next-line deprecation/deprecation
+      // eslint-disable-next-line @typescript-eslint/no-deprecated
       activityInbound: interceptors?.activityInbound ?? [],
       workflowModules: interceptors?.workflowModules ?? [],
     },
@@ -1078,10 +1082,12 @@ function nexusServiceRegistryFromOptions(opts: WorkerOptions): nexus.ServiceRegi
 }
 
 export function toNativeWorkerOptions(opts: CompiledWorkerOptionsWithBuildId): native.WorkerOptions {
+  const enableWorkflows = opts.workflowBundle !== undefined || opts.workflowsPath !== undefined;
+  const enableLocalActivities = enableWorkflows && opts.activities.size > 0;
   return {
     identity: opts.identity,
-    buildId: opts.buildId, // eslint-disable-line deprecation/deprecation
-    useVersioning: opts.useVersioning, // eslint-disable-line deprecation/deprecation
+    buildId: opts.buildId, // eslint-disable-line @typescript-eslint/no-deprecated
+    useVersioning: opts.useVersioning, // eslint-disable-line @typescript-eslint/no-deprecated
     workerDeploymentOptions: toNativeDeploymentOptions(opts.workerDeploymentOptions),
     taskQueue: opts.taskQueue,
     namespace: opts.namespace,
@@ -1090,7 +1096,12 @@ export function toNativeWorkerOptions(opts: CompiledWorkerOptionsWithBuildId): n
     workflowTaskPollerBehavior: toNativeTaskPollerBehavior(opts.workflowTaskPollerBehavior),
     activityTaskPollerBehavior: toNativeTaskPollerBehavior(opts.activityTaskPollerBehavior),
     nexusTaskPollerBehavior: toNativeTaskPollerBehavior(opts.nexusTaskPollerBehavior),
-    enableNonLocalActivities: opts.enableNonLocalActivities,
+    taskTypes: {
+      enableWorkflows,
+      enableLocalActivities,
+      enableRemoteActivities: opts.enableNonLocalActivities && opts.activities.size > 0,
+      enableNexus: opts.nexusServiceRegistry !== undefined,
+    },
     stickyQueueScheduleToStartTimeout: msToNumber(opts.stickyQueueScheduleToStartTimeout),
     maxCachedWorkflows: opts.maxCachedWorkflows,
     maxHeartbeatThrottleInterval: msToNumber(opts.maxHeartbeatThrottleInterval),
@@ -1098,6 +1109,7 @@ export function toNativeWorkerOptions(opts: CompiledWorkerOptionsWithBuildId): n
     maxTaskQueueActivitiesPerSecond: opts.maxTaskQueueActivitiesPerSecond ?? null,
     maxActivitiesPerSecond: opts.maxActivitiesPerSecond ?? null,
     shutdownGraceTime: msToNumber(opts.shutdownGraceTime),
+    plugins: opts.plugins?.map((p) => p.name) ?? [],
   };
 }
 
@@ -1124,8 +1136,16 @@ function toNativeDeploymentOptions(options?: WorkerDeploymentOptions): native.Wo
   if (options === undefined) {
     return null;
   }
+  if (!options.useWorkerVersioning) {
+    return {
+      version: options.version,
+      useWorkerVersioning: false,
+      defaultVersioningBehavior: null,
+    };
+  }
+  const { defaultVersioningBehavior } = options;
   let vb: native.VersioningBehavior;
-  switch (options.defaultVersioningBehavior) {
+  switch (defaultVersioningBehavior) {
     case 'PINNED':
       vb = { type: 'pinned' };
       break;
@@ -1133,12 +1153,12 @@ function toNativeDeploymentOptions(options?: WorkerDeploymentOptions): native.Wo
       vb = { type: 'auto-upgrade' };
       break;
     default:
-      options.defaultVersioningBehavior satisfies never;
-      throw new Error(`Unknown versioning behavior: ${options.defaultVersioningBehavior}`);
+      defaultVersioningBehavior satisfies never;
+      throw new Error(`Unknown versioning behavior: ${defaultVersioningBehavior}`);
   }
   return {
     version: options.version,
-    useWorkerVersioning: options.useWorkerVersioning,
+    useWorkerVersioning: true,
     defaultVersioningBehavior: vb,
   };
 }

@@ -1,6 +1,6 @@
 {
   "name": "@temporalio/testing",
-  "version": "1.13.2",
+  "version": "1.15.0",
   "description": "Temporal.io SDK Testing sub-package",
   "main": "lib/index.js",
   "types": "./lib/index.d.ts",
@@ -31,7 +31,7 @@
   },
   "homepage": "https://github.com/temporalio/sdk-typescript/tree/main/packages/testing",
   "engines": {
-    "node": ">= 18.0.0"
+    "node": ">= 20.0.0"
   },
   "files": [
     "lib",

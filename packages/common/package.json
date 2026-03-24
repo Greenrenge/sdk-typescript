@@ -1,6 +1,6 @@
 {
   "name": "@temporalio/common",
-  "version": "1.13.2",
+  "version": "1.15.0",
   "description": "Common library for code that's used across the Client, Worker, and/or Workflow",
   "main": "lib/index.js",
   "types": "./lib/index.d.ts",
@@ -34,7 +34,7 @@
     "access": "public"
   },
   "engines": {
-    "node": ">= 18.0.0"
+    "node": ">= 20.0.0"
   },
   "files": [
     "src",

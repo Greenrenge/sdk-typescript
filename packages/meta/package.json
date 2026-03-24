@@ -4,6 +4,7 @@
   "description": "Temporal.io SDK meta-package",
   "dependencies": {
     "@temporalio/activity": "workspace:*",
+    "@temporalio/ai-sdk": "workspace:*",
     "@temporalio/client": "workspace:*",
     "@temporalio/common": "workspace:*",
     "@temporalio/envconfig": "workspace:*",
@@ -36,5 +37,6 @@
   "files": [
     "src",
     "lib"
-  ]
+  ],
+  "version": "1.15.0"
 }

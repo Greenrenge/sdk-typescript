@@ -3,7 +3,6 @@ import { ActivityInboundLogInterceptor, DefaultLogger, LogEntry, Runtime } from 
 import { activityLogAttributes } from '@temporalio/worker/lib/activity';
 import { MockActivityEnvironment, defaultActivityInfo } from '@temporalio/testing';
 import { isCancellation } from '@temporalio/workflow';
-import { isAbortError } from '@temporalio/common/lib/type-helpers';
 import * as activity from '@temporalio/activity';
 import { SdkComponent } from '@temporalio/common';
 import { withZeroesHTTPServer } from './zeroes-http-server';
@@ -110,11 +109,11 @@ test('Activity Worker logs when activity is cancelled with signal', async (t) =>
   try {
     await env.run(async () => {
       await withZeroesHTTPServer(async (port) => {
-        await cancellableFetch(`http:127.0.0.1:${port}`);
+        await cancellableFetch(`http://127.0.0.1:${port}`);
       });
     });
   } catch (e) {
-    if (!isAbortError(e)) throw e;
+    if (!isCancellation(e)) throw e;
   }
   const logs = (env.context as MyTestActivityContext).logs;
   const entry = logs.find((x) => x.level === 'DEBUG' && x.message === 'Activity completed as cancelled');
@@ -128,7 +127,7 @@ test('(Legacy) ActivityInboundLogInterceptor does not override Context.log by de
   const env = new MockActivityEnvironment(
     {},
     {
-      // eslint-disable-next-line deprecation/deprecation
+      // eslint-disable-next-line @typescript-eslint/no-deprecated
       interceptors: [(ctx) => ({ inbound: new ActivityInboundLogInterceptor(ctx) })],
       logger: mockLogger,
     }
@@ -150,7 +149,7 @@ test('(Legacy) ActivityInboundLogInterceptor overrides Context.log if a logger i
   const env = new MockActivityEnvironment(
     {},
     {
-      // eslint-disable-next-line deprecation/deprecation
+      // eslint-disable-next-line @typescript-eslint/no-deprecated
       interceptors: [(ctx) => ({ inbound: new ActivityInboundLogInterceptor(ctx, logger) })],
       logger: mockLogger,
     }
@@ -163,7 +162,7 @@ test('(Legacy) ActivityInboundLogInterceptor overrides Context.log if a logger i
 });
 
 test('(Legacy) ActivityInboundLogInterceptor overrides Context.log if class is extended', async (t) => {
-  // eslint-disable-next-line deprecation/deprecation
+  // eslint-disable-next-line @typescript-eslint/no-deprecated
   class CustomActivityInboundLogInterceptor extends ActivityInboundLogInterceptor {
     protected logAttributes(): Record<string, unknown> {
       const { namespace: _, ...rest } = super.logAttributes();

@@ -31,7 +31,7 @@ export interface ScheduleOptions<A extends ScheduleOptionsAction = ScheduleOptio
      * running. This can be changed after a Schedule has taken some Actions, and some changes might produce
      * unintuitive results. In general, the later policy overrides the earlier policy.
      *
-     * @default {@link ScheduleOverlapPolicy.SKIP}
+     * @default ScheduleOverlapPolicy.SKIP
      */
     overlap?: ScheduleOverlapPolicy;
 
@@ -73,7 +73,7 @@ export interface ScheduleOptions<A extends ScheduleOptionsAction = ScheduleOptio
    *
    * @deprecated Use {@link typedSearchAttributes} instead.
    */
-  searchAttributes?: SearchAttributes; // eslint-disable-line deprecation/deprecation
+  searchAttributes?: SearchAttributes; // eslint-disable-line @typescript-eslint/no-deprecated
 
   /**
    * Additional indexed information attached to the Schedule. More info:
@@ -192,7 +192,7 @@ export interface ScheduleSummary {
    *
    * @deprecated Use {@link typedSearchAttributes} instead.
    */
-  searchAttributes?: SearchAttributes; // eslint-disable-line deprecation/deprecation
+  searchAttributes?: SearchAttributes; // eslint-disable-line @typescript-eslint/no-deprecated
 
   /**
    * Additional indexed information attached to the Schedule. More info:
@@ -314,7 +314,7 @@ export type ScheduleDescription = {
    *
    * @deprecated Use {@link typedSearchAttributes} instead.
    */
-  searchAttributes: SearchAttributes; // eslint-disable-line deprecation/deprecation
+  searchAttributes: SearchAttributes; // eslint-disable-line @typescript-eslint/no-deprecated
 
   /**
    * Additional indexed information attached to the Schedule. More info:
@@ -877,7 +877,7 @@ export const ScheduleOverlapPolicy = {
    *
    * @deprecated Either leave property `undefined`, or use {@link SKIP} instead.
    */
-  UNSPECIFIED: undefined, // eslint-disable-line deprecation/deprecation
+  UNSPECIFIED: undefined,
 } as const;
 export type ScheduleOverlapPolicy = (typeof ScheduleOverlapPolicy)[keyof typeof ScheduleOverlapPolicy];
 

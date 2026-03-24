@@ -40,7 +40,7 @@ export type JsonString<_T> = string;
 // Runtime
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-export declare function newRuntime(telemOptions: RuntimeOptions): Runtime;
+export declare function newRuntime(runtimeOptions: RuntimeOptions): Runtime;
 
 export declare function runtimeShutdown(runtime: Runtime): void;
 
@@ -52,6 +52,7 @@ export type RuntimeOptions = {
   logExporter: LogExporterOptions;
   telemetry: TelemetryOptions;
   metricsExporter: MetricExporterOptions;
+  workerHeartbeatIntervalMillis: Option<number>;
 };
 
 export type TelemetryOptions = {
@@ -70,7 +71,11 @@ export type LogExporterOptions =
       receiver: (entries: JsonString<LogEntry>[]) => void;
     };
 
-export type MetricExporterOptions = PrometheusMetricsExporterOptions | OtelMetricsExporterOptions | null;
+export type MetricExporterOptions =
+  | PrometheusMetricsExporterOptions
+  | OtelMetricsExporterOptions
+  | BufferedMetricsExporterOptions
+  | null;
 
 export interface PrometheusMetricsExporterOptions {
   type: 'prometheus';
@@ -92,6 +97,12 @@ export interface OtelMetricsExporterOptions {
   useSecondsForDurations: boolean;
   histogramBucketOverrides: Record<string, number[]>;
   protocol: 'http' | 'grpc';
+}
+
+export interface BufferedMetricsExporterOptions {
+  type: 'buffer';
+  maxBufferSize: number;
+  useSecondsForDurations: boolean;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -122,20 +133,20 @@ export interface ClientOptions {
   targetUrl: string;
   clientName: string;
   clientVersion: string;
-  tls: Option<TLSConfig>;
+  tls: Option<TlsOptions>;
   httpConnectProxy: Option<HttpConnectProxy>;
   headers: Option<Record<string, MetadataValue>>;
   apiKey: Option<string>;
   disableErrorCodeMetricTags: boolean;
 }
 
-export interface TLSConfig {
+export interface TlsOptions {
   domain: Option<string>;
   serverRootCaCert: Option<Buffer>;
-  clientTlsConfig: Option<TlsConfigClientCertPair>;
+  clientTlsOptions: Option<TlsOptionsClientCertPair>;
 }
 
-export interface TlsConfigClientCertPair {
+export interface TlsOptionsClientCertPair {
   clientCert: Buffer;
   clientPrivateKey: Buffer;
 }
@@ -167,7 +178,7 @@ export interface RpcCall {
 
 export declare function newWorker(client: Client, workerOptions: WorkerOptions): Worker;
 
-export declare function workerValidate(worker: Worker): Promise<void>;
+export declare function workerValidate(worker: Worker): Promise<Buffer>;
 
 export declare function workerPollWorkflowActivation(worker: Worker): Promise<Buffer>;
 
@@ -186,6 +197,8 @@ export declare function workerCompleteNexusTask(worker: Worker, result: Buffer):
 export declare function workerInitiateShutdown(worker: Worker): void;
 
 export declare function workerFinalizeShutdown(worker: Worker): Promise<void>;
+
+export declare function workerReplaceClient(worker: Worker, client: Client): void;
 
 export interface Worker {
   type: 'worker';
@@ -213,7 +226,12 @@ export interface WorkerOptions {
   workflowTaskPollerBehavior: PollerBehavior;
   activityTaskPollerBehavior: PollerBehavior;
   nexusTaskPollerBehavior: PollerBehavior;
-  enableNonLocalActivities: boolean;
+  taskTypes: {
+    enableWorkflows: boolean;
+    enableLocalActivities: boolean;
+    enableRemoteActivities: boolean;
+    enableNexus: boolean;
+  };
   stickyQueueScheduleToStartTimeout: number;
   maxCachedWorkflows: number;
   maxHeartbeatThrottleInterval: number;
@@ -221,6 +239,7 @@ export interface WorkerOptions {
   maxTaskQueueActivitiesPerSecond: Option<number>;
   maxActivitiesPerSecond: Option<number>;
   shutdownGraceTime: number;
+  plugins: string[];
 }
 
 export type PollerBehavior =
@@ -238,7 +257,7 @@ export type PollerBehavior =
 export type WorkerDeploymentOptions = {
   version: WorkerDeploymentVersion;
   useWorkerVersioning: boolean;
-  defaultVersioningBehavior: VersioningBehavior;
+  defaultVersioningBehavior: Option<VersioningBehavior>;
 };
 
 export type WorkerDeploymentVersion = {
@@ -516,3 +535,27 @@ export declare function setMetricGaugeF64Value(
   value: number,
   attrs: JsonString<MetricAttributes>
 ): void;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Buffered Metrics
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+export declare function runtimeRetrieveBufferedMetrics(runtime: Runtime): BufferedMetricUpdate[];
+
+export interface BufferedMetricUpdate {
+  metric: BufferedMetric;
+  value: number;
+  attributes: MetricAttributes;
+}
+
+export interface BufferedMetric {
+  name: string;
+  description: string;
+  unit: string;
+  kind: BufferedMetricKind;
+  valueType: BufferedMetricValueType;
+}
+
+export type BufferedMetricKind = 'counter' | 'histogram' | 'gauge';
+
+export type BufferedMetricValueType = 'int' | 'float';

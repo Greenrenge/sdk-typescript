@@ -523,7 +523,7 @@ export async function buildIdTester(): Promise<void> {
   });
 
   workflow.setHandler(getBuildIdQuery, () => {
-    return workflow.workflowInfo().currentBuildId ?? ''; // eslint-disable-line deprecation/deprecation
+    return workflow.workflowInfo().currentBuildId ?? ''; // eslint-disable-line @typescript-eslint/no-deprecated
   });
 
   // The unblock signal will only be sent once we are in Worker 1.1.
@@ -951,7 +951,7 @@ export async function cancellationScopeWithTimeoutTimerGetsCancelled(): Promise<
     // Fix enabled: this timer will get cancelled
   });
 
-  // Timer cancelation won't appear in history if it sent in the same WFT as workflow complete
+  // Timer cancellation won't appear in history if it sent in the same WFT as workflow complete
   await activitySleep(1);
 
   //@ts-expect-error TSC can't see that scope variables will be initialized synchronously
@@ -973,10 +973,10 @@ test('CancellationScope.withTimeout() - timer gets cancelled', async (t) => {
 
   const { events } = await handle.fetchHistory();
 
-  const timerCanceledEvents = events?.filter((ev) => ev.timerCanceledEventAttributes) ?? [];
-  t.is(timerCanceledEvents?.length, 1);
+  const timerCancelledEvents = events?.filter((ev) => ev.timerCanceledEventAttributes) ?? [];
+  t.is(timerCancelledEvents?.length, 1);
 
-  const timerStartedEventId = timerCanceledEvents[0].timerCanceledEventAttributes?.startedEventId;
+  const timerStartedEventId = timerCancelledEvents[0].timerCanceledEventAttributes?.startedEventId;
   const timerStartedEvent = events?.find((ev) => ev.eventId?.toNumber() === timerStartedEventId?.toNumber());
   t.is(tsToMs(timerStartedEvent?.timerStartedEventAttributes?.startToFireTimeout), msToNumber('12s'));
 });
@@ -1000,7 +1000,7 @@ export async function cancellationScopeWithTimeoutScopeGetCancelledOnTimeout(): 
     await activitySleep(7000);
   }).catch(() => undefined);
 
-  // Activity cancelation won't appear in history if it sent in the same WFT as workflow complete
+  // Activity cancellation won't appear in history if it sent in the same WFT as workflow complete
   await activitySleep(1);
 
   //@ts-expect-error TSC can't see that scope variables will be initialized synchronously
@@ -1171,7 +1171,7 @@ test("Lang's SDK flags replay correctly", async (t) => {
   await worker.runUntil(() => handle.result());
 
   const worker2 = await createWorker();
-  await worker2.runUntil(() => handle.query('__stack_trace'));
+  await worker2.runUntil(() => handle.query('__temporal_workflow_metadata'));
 
   // Query would have thrown if the workflow couldn't be replayed correctly
   t.pass();
@@ -1316,7 +1316,7 @@ test.serial('can register search attributes to dev server', async (t) => {
   // Expect workflow description to have search attribute.
   const desc = await handle.describe();
   t.deepEqual(desc.typedSearchAttributes, new TypedSearchAttributes([newSearchAttribute]));
-  t.deepEqual(desc.searchAttributes, { 'new-search-attr': [12] }); // eslint-disable-line deprecation/deprecation
+  t.deepEqual(desc.searchAttributes, { 'new-search-attr': [12] }); // eslint-disable-line @typescript-eslint/no-deprecated
   await env.teardown();
 });
 

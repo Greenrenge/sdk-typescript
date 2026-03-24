@@ -137,9 +137,6 @@ export class SimplePlugin
    * @returns Promise that resolves when worker execution completes
    */
   runWorker(worker: Worker, next: (w: Worker) => Promise<void>): Promise<void> {
-    console.log('Hello');
-    console.log('This:', this);
-    console.log('Options:', this.options);
     if (this.options.runContext !== undefined) {
       return this.options.runContext(() => next(worker));
     }
@@ -152,9 +149,14 @@ export class SimplePlugin
    * @returns Modified bundle options with plugin configuration applied
    */
   configureBundler(options: BundleOptions): BundleOptions {
+    const workerInterceptors = resolveWorkerInterceptors(undefined, this.options.workerInterceptors);
     return {
       ...options,
       workflowsPath: resolveRequiredParameter(options.workflowsPath, this.options.workflowsPath),
+      workflowInterceptorModules: resolveAppendParameter(
+        options.workflowInterceptorModules,
+        workerInterceptors?.workflowModules
+      ),
     };
   }
 
@@ -265,7 +267,7 @@ function resolveWorkerInterceptors(
 }
 
 function modernWorkflowInterceptors(
-  // eslint-disable-next-line deprecation/deprecation
+  // eslint-disable-next-line @typescript-eslint/no-deprecated
   interceptors: WorkflowClientInterceptors | WorkflowClientInterceptor[] | undefined
 ): WorkflowClientInterceptor[] | undefined {
   if (interceptors === undefined || Array.isArray(interceptors)) {

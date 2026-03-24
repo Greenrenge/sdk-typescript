@@ -22,6 +22,7 @@ export {
 export * from './interceptors';
 export { DefaultLogger, LogEntry, LogLevel, LogMetadata, LogTimestamp, Logger } from './logger';
 export { History, Runtime } from './runtime';
+export { MetricsBuffer, MetricsBufferOptions, BufferedMetricUpdate } from './runtime-metrics';
 export {
   RuntimeOptions,
   makeTelemetryFilterString,
@@ -38,6 +39,7 @@ export { DataConverter, defaultPayloadConverter, State, Worker, WorkerStatus } f
 export {
   CompiledWorkerOptions,
   ReplayWorkerOptions,
+  WorkerDeploymentOptions,
   WorkerOptions,
   WorkerPlugin,
   WorkflowBundle,
@@ -66,7 +68,6 @@ export {
   SlotReleaseContext,
 } from './worker-tuner';
 
-/* eslint-disable deprecation/deprecation */
 // Anything below this line is deprecated
 
 export {

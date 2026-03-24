@@ -19,12 +19,12 @@ import {
   convertWorkflowEventLinkToNexusLink,
   convertNexusLinkToWorkflowEventLink,
 } from '@temporalio/nexus/lib/link-converter';
-import { cleanStackTrace, compareStackTrace, getRandomPort } from './helpers';
+import { isBun, cleanStackTrace, compareStackTrace, getRandomPort } from './helpers';
 
 export interface Context {
   httpPort: number;
   taskQueue: string;
-  endpointId: string;
+  endpoint: testing.NexusEndpointIdentifier;
   env: testing.TestWorkflowEnvironment;
   logEntries: LogEntry[];
 }
@@ -64,24 +64,21 @@ test.after.always(async (t) => {
 test.beforeEach(async (t) => {
   const taskQueue = t.title + randomUUID();
   const { env } = t.context;
-  const response = await env.connection.operatorService.createNexusEndpoint({
-    spec: {
-      name: t.title.replaceAll(/[\s,.]/g, '-'),
-      target: {
-        worker: {
-          namespace: 'default',
-          taskQueue,
-        },
-      },
-    },
-  });
+  const endpointName = taskQueue.replaceAll(/[\s,.]/g, '-');
+  const endpoint = await env.createNexusEndpoint(endpointName, taskQueue);
+
   t.context.taskQueue = taskQueue;
-  t.context.endpointId = response.endpoint!.id!;
-  t.truthy(t.context.endpointId);
+  t.context.endpoint = endpoint;
+});
+
+test.afterEach(async (t) => {
+  const { env, endpoint } = t.context;
+  await env.deleteNexusEndpoint(endpoint);
 });
 
 test('sync Operation Handler happy path', async (t) => {
-  const { env, taskQueue, httpPort, endpointId } = t.context;
+  const { env, taskQueue, httpPort, endpoint } = t.context;
+  const endpointId = endpoint.id;
 
   const testServiceHandler = nexus.serviceHandler(
     nexus.service('testService', {
@@ -127,8 +124,9 @@ test('sync Operation Handler happy path', async (t) => {
   });
 });
 
-test('Operation Handler cancelation', async (t) => {
-  const { env, taskQueue, httpPort, endpointId } = t.context;
+test('Operation Handler cancellation', async (t) => {
+  const { env, taskQueue, httpPort, endpoint } = t.context;
+  const endpointId = endpoint.id;
   let p: Promise<never> | undefined;
 
   const w = await Worker.create({
@@ -180,7 +178,8 @@ test('Operation Handler cancelation', async (t) => {
 });
 
 test('async Operation Handler happy path', async (t) => {
-  const { env, taskQueue, httpPort, endpointId } = t.context;
+  const { env, taskQueue, httpPort, endpoint } = t.context;
+  const endpointId = endpoint.id;
   const requestId = 'test-' + randomUUID();
 
   const w = await Worker.create({
@@ -258,7 +257,8 @@ test('async Operation Handler happy path', async (t) => {
 });
 
 test('start Operation Handler errors', async (t) => {
-  const { env, taskQueue, httpPort, endpointId } = t.context;
+  const { env, taskQueue, httpPort, endpoint } = t.context;
+  const endpointId = endpoint.id;
 
   const w = await Worker.create({
     connection: env.nativeConnection,
@@ -317,7 +317,14 @@ test('start Operation Handler errors', async (t) => {
       compareStackTrace(
         t,
         cleanStackTrace(err.stack!),
-        `ApplicationFailure: deliberate failure
+        isBun
+          ? `ApplicationFailure: deliberate failure
+    at create (common/lib/failure.js)
+    at op (test/lib/test-nexus-handler.js)
+    at <anonymous> (nexus-rpc/lib/handler/operation-handler.js)
+    at start (nexus-rpc/lib/handler/service-registry.js)
+    at processTicksAndRejections (native)`
+          : `ApplicationFailure: deliberate failure
     at $CLASS.create (common/src/failure.ts)
     at op (test/src/test-nexus-handler.ts)
     at Object.start (nexus-rpc/src/handler/operation-handler.ts)
@@ -345,7 +352,13 @@ test('start Operation Handler errors', async (t) => {
       t.is(err.message, '');
       t.deepEqual(
         cleanStackTrace(err.stack!),
-        `HandlerError: deliberate error
+        isBun
+          ? `HandlerError: deliberate error
+    at op (test/lib/test-nexus-handler.js)
+    at <anonymous> (nexus-rpc/lib/handler/operation-handler.js)
+    at start (nexus-rpc/lib/handler/service-registry.js)
+    at processTicksAndRejections (native)`
+          : `HandlerError: deliberate error
     at op (test/src/test-nexus-handler.ts)
     at Object.start (nexus-rpc/src/handler/operation-handler.ts)
     at ServiceRegistry.start (nexus-rpc/src/handler/service-registry.ts)`
@@ -368,9 +381,16 @@ test('start Operation Handler errors', async (t) => {
       t.true(err instanceof Error);
       t.is(err.message, '');
       t.is(res.headers.get('nexus-operation-state'), 'failed');
-      t.deepEqual(
+      compareStackTrace(
+        t,
         cleanStackTrace(err.stack!),
-        `OperationError: deliberate error
+        isBun
+          ? `OperationError: deliberate error
+    at op (test/lib/test-nexus-handler.js)
+    at <anonymous> (nexus-rpc/lib/handler/operation-handler.js)
+    at start (nexus-rpc/lib/handler/service-registry.js)
+    at processTicksAndRejections (native)`
+          : `OperationError: deliberate error
     at op (test/src/test-nexus-handler.ts)
     at Object.start (nexus-rpc/src/handler/operation-handler.ts)
     at ServiceRegistry.start (nexus-rpc/src/handler/service-registry.ts)`
@@ -386,14 +406,15 @@ test('start Operation Handler errors', async (t) => {
       });
       t.is(res.status, 400);
       const { message } = (await res.json()) as { message: string };
-      // Exact error message varies between Node versions.
-      t.regex(message, /Failed to deserialize input: SyntaxError: Unexpected token .* JSON/);
+      // Exact error message varies between Node versions and runtimes.
+      t.regex(message, isBun ? /JSON Parse error:/ : /Unexpected token .* JSON/);
     }
   });
 });
 
 test('cancel Operation Handler errors', async (t) => {
-  const { env, taskQueue, httpPort, endpointId } = t.context;
+  const { env, taskQueue, httpPort, endpoint } = t.context;
+  const endpointId = endpoint.id;
 
   const w = await Worker.create({
     connection: env.nativeConnection,
@@ -464,7 +485,12 @@ test('cancel Operation Handler errors', async (t) => {
       compareStackTrace(
         t,
         cleanStackTrace(err.stack!),
-        `ApplicationFailure: deliberate failure
+        isBun
+          ? `ApplicationFailure: deliberate failure
+    at create (common/lib/failure.js)
+    at cancel (test/lib/test-nexus-handler.js)
+    at cancel (nexus-rpc/lib/handler/service-registry.js)`
+          : `ApplicationFailure: deliberate failure
     at $CLASS.create (common/src/failure.ts)
     at Object.cancel (test/src/test-nexus-handler.ts)
     at ServiceRegistry.cancel (nexus-rpc/src/handler/service-registry.ts)`
@@ -492,9 +518,14 @@ test('cancel Operation Handler errors', async (t) => {
       delete failure.details;
       t.true(err instanceof Error);
       t.is(err.message, '');
-      t.deepEqual(
+      compareStackTrace(
+        t,
         cleanStackTrace(err.stack!),
-        `HandlerError: deliberate error
+        isBun
+          ? `HandlerError: deliberate error
+    at cancel (test/lib/test-nexus-handler.js)
+    at cancel (nexus-rpc/lib/handler/service-registry.js)`
+          : `HandlerError: deliberate error
     at Object.cancel (test/src/test-nexus-handler.ts)
     at ServiceRegistry.cancel (nexus-rpc/src/handler/service-registry.ts)`
       );
@@ -503,7 +534,8 @@ test('cancel Operation Handler errors', async (t) => {
 });
 
 test('logger is available in handler context', async (t) => {
-  const { env, taskQueue, httpPort, endpointId, logEntries } = t.context;
+  const { env, taskQueue, httpPort, endpoint, logEntries } = t.context;
+  const endpointId = endpoint.id;
 
   const w = await Worker.create({
     connection: env.nativeConnection,
@@ -552,7 +584,8 @@ test('logger is available in handler context', async (t) => {
 });
 
 test('getClient is available in handler context', async (t) => {
-  const { env, taskQueue, httpPort, endpointId } = t.context;
+  const { env, taskQueue, httpPort, endpoint } = t.context;
+  const endpointId = endpoint.id;
 
   const w = await Worker.create({
     connection: env.nativeConnection,
@@ -588,8 +621,50 @@ test('getClient is available in handler context', async (t) => {
   });
 });
 
+test('operationInfo is available in handler context', async (t) => {
+  const { env, taskQueue, httpPort, endpoint } = t.context;
+  const endpointId = endpoint.id;
+
+  const w = await Worker.create({
+    connection: env.nativeConnection,
+    namespace: env.namespace,
+    taskQueue,
+    nexusServices: [
+      nexus.serviceHandler(
+        nexus.service('testService', {
+          testSyncOp: nexus.operation<void, { namespace: string; taskQueue: string }>(),
+        }),
+        {
+          async testSyncOp() {
+            const info = temporalnexus.operationInfo();
+            return {
+              namespace: info.namespace,
+              taskQueue: info.taskQueue,
+            };
+          },
+        }
+      ),
+    ],
+  });
+
+  await w.runUntil(async () => {
+    const res = await fetch(
+      `http://127.0.0.1:${httpPort}/nexus/endpoints/${endpointId}/services/testService/testSyncOp`,
+      {
+        method: 'POST',
+      }
+    );
+    t.true(res.ok);
+    const output = (await res.json()) as { namespace: string; taskQueue: string };
+    t.is(output.namespace, 'default');
+    t.is(output.taskQueue, taskQueue);
+  });
+});
+
 test('WorkflowRunOperationHandler attaches callback, link, and request ID', async (t) => {
-  const { env, taskQueue, httpPort, endpointId } = t.context;
+  const { env, taskQueue, httpPort, endpoint } = t.context;
+  const endpointId = endpoint.id;
+
   const requestId1 = randomUUID();
   const requestId2 = randomUUID();
   const workflowId = t.title;
@@ -712,5 +787,104 @@ test('WorkflowRunOperationHandler does not accept WorkflowHandle from WorkflowCl
   );
 
   // This test only checks for compile-time error.
+  t.pass();
+});
+
+export async function echoWorkflow(input: string): Promise<string> {
+  return input;
+}
+
+test('WorkflowRunOperationHandler infers correct output type from typed workflow function', async (t) => {
+  // When constructing WorkflowRunOperationHandler without explicit type parameters using a typed
+  // workflow function, the operation output type should be inferred as the workflow's return type
+  const _stringOp: nexus.OperationHandler<string, string> = new temporalnexus.WorkflowRunOperationHandler(
+    async (ctx, input: string) => {
+      return await temporalnexus.startWorkflow(ctx, echoWorkflow, {
+        args: [input],
+        workflowId: 'test',
+      });
+    }
+  );
+
+  // @ts-expect-error - Output type should be string, not number
+  const _mismatchedOp: nexus.OperationHandler<string, number> = new temporalnexus.WorkflowRunOperationHandler(
+    async (ctx, input: string) => {
+      return await temporalnexus.startWorkflow(ctx, echoWorkflow, {
+        args: [input],
+        workflowId: 'test',
+      });
+    }
+  );
+
+  // Explicit type parameters should also work correctly.
+  const _explicitStringOp: nexus.OperationHandler<string, string> = new temporalnexus.WorkflowRunOperationHandler<
+    string,
+    string
+  >(async (ctx, input) => {
+    return await temporalnexus.startWorkflow(ctx, echoWorkflow, {
+      args: [input],
+      workflowId: 'test',
+    });
+  });
+
+  // @ts-expect-error - Explicit output type string is not assignable to number
+  const _explicitMismatchedOp: nexus.OperationHandler<string, number> = new temporalnexus.WorkflowRunOperationHandler<
+    string,
+    string
+  >(async (ctx, input) => {
+    return await temporalnexus.startWorkflow(ctx, echoWorkflow, {
+      args: [input],
+      workflowId: 'test',
+    });
+  });
+
+  const _explicitContradictsWorkflow: nexus.OperationHandler<string, number> =
+    // @ts-expect-error - Explicit type params <string, number> contradict echoWorkflow which returns string
+    new temporalnexus.WorkflowRunOperationHandler<string, number>(async (ctx, input) => {
+      return await temporalnexus.startWorkflow(ctx, echoWorkflow, {
+        args: [input],
+        workflowId: 'test',
+      });
+    });
+
+  // When a string workflow name is used, T infers as Workflow (the base type), so
+  // WorkflowResultType<Workflow> resolves to `any`. This means the handler is assignable to any
+  // output type and TypeScript cannot catch mismatches.
+  const _stringNameOp: nexus.OperationHandler<string, string> = new temporalnexus.WorkflowRunOperationHandler(
+    async (ctx, input: string) => {
+      return await temporalnexus.startWorkflow(ctx, 'some-workflow', {
+        args: [input],
+        workflowId: 'test',
+      });
+    }
+  );
+
+  // This is NOT caught — string workflow names lose type safety on the output type.
+  const _stringNameAnyOutput: nexus.OperationHandler<string, number> = new temporalnexus.WorkflowRunOperationHandler(
+    async (ctx, input: string) => {
+      return await temporalnexus.startWorkflow(ctx, 'some-workflow', {
+        args: [input],
+        workflowId: 'test',
+      });
+    }
+  );
+
+  // This test only checks for compile-time errors.
+  t.pass();
+});
+
+test('createNexusEndpoint and deleteNexusEndpoint', async (t) => {
+  const { env } = t.context;
+  const taskQueue = 'test-delete-endpoint-' + randomUUID();
+  const endpointName = 'test-delete-endpoint-' + randomUUID();
+
+  // Create an endpoint
+  const endpoint = await env.createNexusEndpoint(endpointName, taskQueue);
+  t.truthy(endpoint.id);
+  t.truthy(endpoint.version);
+  t.is(endpoint.raw.spec?.name, endpointName);
+
+  // Delete the endpoint
+  await env.deleteNexusEndpoint(endpoint);
   t.pass();
 });

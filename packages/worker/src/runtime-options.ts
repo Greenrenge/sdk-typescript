@@ -3,6 +3,7 @@ import { Logger, LogLevel } from '@temporalio/common';
 import { Duration, msToNumber } from '@temporalio/common/lib/time';
 import { DefaultLogger } from './logger';
 import { NativeLogCollector } from './runtime-logger';
+import { MetricsBuffer } from './runtime-metrics';
 
 /**
  * Options used to create a Temporal Runtime.
@@ -31,6 +32,14 @@ export interface RuntimeOptions {
    * Options for Core-side telemetry, including logs and metrics.
    */
   telemetryOptions?: TelemetryOptions;
+
+  /**
+   * Interval for worker heartbeats. Accepted range is between 1s and 60s. `0` disables heartbeating.
+   *
+   * @format number of milliseconds or {@link https://www.npmjs.com/package/ms | ms-formatted string}
+   * @default 60000 (60 seconds)
+   */
+  workerHeartbeatInterval?: Duration;
 
   /**
    * Automatically shutdown workers on any of these signals.
@@ -206,6 +215,8 @@ export type MetricsExporterConfig = {
 
   /**
    * Tags to add to all metrics emitted by the worker.
+   *
+   * Note that this is not supported when the metrics are buffered.
    */
   globalTags?: Record<string, string>;
 
@@ -215,7 +226,7 @@ export type MetricsExporterConfig = {
    * @default true
    */
   attachServiceName?: boolean;
-} & (PrometheusMetricsExporter | OtelCollectorExporter);
+} & (PrometheusMetricsExporter | OtelCollectorExporter | BufferedMetricsExporter);
 
 /**
  * OpenTelemetry Collector options for exporting metrics or traces
@@ -351,6 +362,15 @@ export interface PrometheusMetricsExporter {
   };
 }
 
+/**
+ * Buffered metrics exporter options
+ *
+ * @experimental Buffered metrics is an experimental feature. APIs may be subject to change.
+ */
+export interface BufferedMetricsExporter {
+  buffer: MetricsBuffer;
+}
+
 // Compile Options ////////////////////////////////////////////////////////////////////////////////
 
 /**
@@ -359,18 +379,21 @@ export interface PrometheusMetricsExporter {
  */
 export interface CompiledRuntimeOptions {
   shutdownSignals: NodeJS.Signals[];
-  telemetryOptions: native.RuntimeOptions;
+  runtimeOptions: native.RuntimeOptions;
   logger: Logger;
+  metricsBuffer: MetricsBuffer | undefined;
 }
 
 export function compileOptions(options: RuntimeOptions): CompiledRuntimeOptions {
-  const { metrics, noTemporalPrefixForMetrics } = options.telemetryOptions ?? {}; // eslint-disable-line deprecation/deprecation
+  const { metrics, noTemporalPrefixForMetrics } = options.telemetryOptions ?? {}; // eslint-disable-line @typescript-eslint/no-deprecated
   const [logger, logExporter] = compileLoggerOptions(options);
+
+  const heartbeatMillis = msToNumber(options.workerHeartbeatInterval ?? '60s');
 
   return {
     logger,
     shutdownSignals: options.shutdownSignals ?? ['SIGINT', 'SIGTERM', 'SIGQUIT', 'SIGUSR2'],
-    telemetryOptions: {
+    runtimeOptions: {
       logExporter,
       telemetry: {
         metricPrefix: metrics?.metricPrefix ?? (noTemporalPrefixForMetrics ? '' : 'temporal_'),
@@ -395,17 +418,25 @@ export function compileOptions(options: RuntimeOptions): CompiledRuntimeOptions 
                 headers: metrics.otel.headers ?? {},
                 metricPeriodicity: msToNumber(metrics.otel.metricsExportInterval ?? '1s'),
                 useSecondsForDurations: metrics.otel.useSecondsForDurations ?? false,
-                metricTemporality: metrics.otel.temporality ?? metrics.temporality ?? 'cumulative', // eslint-disable-line deprecation/deprecation
+                metricTemporality: metrics.otel.temporality ?? metrics.temporality ?? 'cumulative', // eslint-disable-line @typescript-eslint/no-deprecated
                 histogramBucketOverrides: metrics.otel.histogramBucketOverrides ?? {},
                 globalTags: metrics.globalTags ?? {},
               } satisfies native.MetricExporterOptions)
-            : null,
+            : metrics && isBufferedMetricsExporter(metrics)
+              ? ({
+                  type: 'buffer',
+                  maxBufferSize: metrics.buffer.maxBufferSize ?? 10000,
+                  useSecondsForDurations: metrics.buffer.useSecondsForDurations ?? false,
+                } satisfies native.MetricExporterOptions)
+              : null,
+      workerHeartbeatIntervalMillis: heartbeatMillis === 0 ? null : heartbeatMillis,
     },
+    metricsBuffer: metrics && isBufferedMetricsExporter(metrics) ? metrics.buffer : undefined,
   };
 }
 
 function compileLoggerOptions(options: RuntimeOptions): [Logger, native.LogExporterOptions] {
-  const { logging, tracingFilter } = options.telemetryOptions ?? {}; // eslint-disable-line deprecation/deprecation
+  const { logging, tracingFilter } = options.telemetryOptions ?? {}; // eslint-disable-line @typescript-eslint/no-deprecated
 
   const logger = options.logger ?? new DefaultLogger('INFO');
 
@@ -422,7 +453,7 @@ function compileLoggerOptions(options: RuntimeOptions): [Logger, native.LogExpor
       throw new TypeError('Invalid logging filter');
     }
   }
-  // eslint-disable-next-line deprecation/deprecation
+  // eslint-disable-next-line @typescript-eslint/no-deprecated
   const forwardLevel = (logging as ForwardLogger | undefined)?.forward?.level;
   const forwardLevelFilter =
     forwardLevel &&
@@ -477,6 +508,10 @@ function isOtelCollectorExporter(metrics: MetricsExporterConfig): metrics is Ote
 
 function isPrometheusMetricsExporter(metrics: MetricsExporterConfig): metrics is PrometheusMetricsExporter {
   return 'prometheus' in metrics && typeof metrics.prometheus === 'object';
+}
+
+function isBufferedMetricsExporter(metrics: MetricsExporterConfig): metrics is BufferedMetricsExporter {
+  return 'buffer' in metrics && typeof metrics.buffer === 'object';
 }
 
 function isForwardingLogger(options: LogExporterConfig): boolean {

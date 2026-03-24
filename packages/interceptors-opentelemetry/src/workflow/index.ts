@@ -36,12 +36,12 @@ let contextManager: undefined | ContextManager = undefined;
 function getTracer(): otel.Tracer {
   if (contextManager === undefined) {
     contextManager = new ContextManager();
+    otel.context.setGlobalContextManager(contextManager);
   }
   if (tracer === undefined) {
-    const provider = new tracing.BasicTracerProvider();
-
-    // provider.addSpanProcessor(new tracing.SimpleSpanProcessor(new SpanExporter()));
-    // provider.register({ contextManager });
+    const provider = new tracing.BasicTracerProvider({
+      spanProcessors: [new tracing.SimpleSpanProcessor(new SpanExporter())],
+    });
     tracer = provider.getTracer('@temporalio/interceptor-workflow');
   }
   return tracer;

@@ -1,8 +1,9 @@
+import { type AsyncLocalStorage } from 'async_hooks';
 import * as otel from '@opentelemetry/api';
-import { AsyncLocalStorage } from '@temporalio/workflow';
 
 export class ContextManager implements otel.ContextManager {
-  protected storage = new AsyncLocalStorage<otel.Context>();
+  // The workflow sandbox provides AsyncLocalStorage through globalThis.
+  protected storage: AsyncLocalStorage<otel.Context> = new (globalThis as any).AsyncLocalStorage();
 
   active(): otel.Context {
     return this.storage.getStore() || otel.ROOT_CONTEXT;
@@ -27,7 +28,7 @@ export class ContextManager implements otel.ContextManager {
      * It isn't possible to tell Typescript that contextWrapper is the same as T
      * so we forced to cast as any here.
      */
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
     return contextWrapper as any;
   }
 

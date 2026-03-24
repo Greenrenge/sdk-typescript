@@ -3,7 +3,7 @@ import * as net from 'net';
 import path from 'path';
 import * as grpc from '@grpc/grpc-js';
 import asyncRetry from 'async-retry';
-import ava, { TestFn } from 'ava';
+import ava, { TestFn, ExecutionContext } from 'ava';
 import StackUtils from 'stack-utils';
 import { v4 as uuid4 } from 'uuid';
 import { Client, Connection } from '@temporalio/client';
@@ -18,8 +18,7 @@ import {
 } from '@temporalio/testing';
 import * as worker from '@temporalio/worker';
 import { Worker as RealWorker, WorkerOptions } from '@temporalio/worker';
-import { inWorkflowContext, WorkflowInfo } from '@temporalio/workflow';
-import { LoggerSinksInternal as DefaultLoggerSinks } from '@temporalio/workflow/lib/logs';
+import { inWorkflowContext } from '@temporalio/workflow';
 
 export function u8(s: string): Uint8Array {
   // TextEncoder requires lib "dom"
@@ -35,6 +34,7 @@ function isSet(env: string | undefined, def: boolean): boolean {
 }
 
 export const RUN_INTEGRATION_TESTS = inWorkflowContext() || isSet(process.env.RUN_INTEGRATION_TESTS, true);
+export const isBun = typeof (globalThis as any).Bun !== 'undefined';
 export const REUSE_V8_CONTEXT = inWorkflowContext() || isSet(process.env.REUSE_V8_CONTEXT, true);
 export const RUN_TIME_SKIPPING_TESTS =
   inWorkflowContext() || !(process.platform === 'linux' && process.arch === 'arm64');
@@ -81,7 +81,7 @@ export function cleanStackTrace(ostack: string): string {
   const su = new StackUtils({ cwd: path.join(__dirname, '../..') });
   const firstLine = stack.split('\n')[0];
   const cleanedStack = su.clean(stack).trimEnd();
-  const normalizedStack =
+  let normalizedStack =
     cleanedStack &&
     cleanedStack
       .replace(/:\d+:\d+/g, '')
@@ -91,7 +91,35 @@ export function cleanStackTrace(ostack: string): string {
       .replace(/at null\./g, 'at ')
       .replace(/\\/g, '/');
 
+  // FIXME: Find a better way to handle package vendoring; this will come back again.
+  normalizedStack = normalizedStack
+    .replaceAll(/\([^() ]*\/node_modules\//g, '(')
+    .replaceAll(/\([^() ]*\/nexus-sdk-typescript\/src/g, '(nexus-rpc/src');
+
   return normalizedStack ? `${firstLine}\n${normalizedStack}` : firstLine;
+}
+
+/**
+ * Compare stack traces using keywords to match any inconsistent parts of the stack trace
+ *
+ * As of Node 24.6.0 type names are now present on source mapped stack traces which leads
+ * to different stack traces depending on Node version.
+ * See [f33e0fcc83954f728fcfd2ef6ae59435bc4af059](https://github.com/nodejs/node/commit/f33e0fcc83954f728fcfd2ef6ae59435bc4af059)
+ *
+ * Bun does not support promise hooks meaning we are currently unable to apply the source map on stack traces and workflow bundles
+ * end up in the stack trace.
+ *
+ * Special:
+ * - $CLASS: used to match class names that might be inconsistent
+ * - $HASH: used to match bundle hash suffixes in workflow paths
+ */
+export function compareStackTrace(t: ExecutionContext, actual: string, expected: string): void {
+  const escapedTrace = expected
+    .replace(/[|\\{}()[\]^$+*?.]/g, '\\$&')
+    .replace(/-/g, '\\x2d')
+    .replaceAll('\\$CLASS', '(?:[A-Za-z]+)')
+    .replaceAll('\\$HASH', '(?:[A-Za-z0-9]+)');
+  t.regex(actual, RegExp(`^${escapedTrace}$`));
 }
 
 function noopTest(): void {
@@ -122,6 +150,7 @@ export const bundlerOptions = {
     '@temporalio/activity',
     '@temporalio/client',
     '@temporalio/testing',
+    '@temporalio/nexus',
     '@temporalio/worker',
     'ava',
     'crypto',
@@ -136,6 +165,7 @@ export const bundlerOptions = {
     'timers',
     'timers/promises',
     require.resolve('./activities'),
+    require.resolve('./mock-native-worker'),
   ],
 };
 
@@ -166,12 +196,12 @@ if (inWorkflowContext()) {
 
   // eslint-disable-next-line @typescript-eslint/ban-ts-comment
   // @ts-ignore
-  RealTestWorkflowEnvironment = class {}; // eslint-disable-line import/namespace
+  RealTestWorkflowEnvironment = class {};
 }
 
 export class Worker extends worker.Worker {
   static async create(options: WorkerOptions): Promise<worker.Worker> {
-    return RealWorker.create({ ...options, reuseV8Context: REUSE_V8_CONTEXT });
+    return RealWorker.create({ ...options, reuseV8Context: options.reuseV8Context ?? REUSE_V8_CONTEXT });
   }
 }
 
@@ -278,6 +308,32 @@ export async function registerDefaultCustomSearchAttributes(connection: Connecti
   console.log(`... Registered (took ${timeTaken / 1000} sec)!`);
 }
 
+/**
+ * Return a random TCP port number, that is guaranteed to be either available, or to be in use.
+ *
+ * To get a port that is guaranteed to be available, simply call the function directly.
+ *
+ * ```ts
+ * const port = await getRandomPort();
+ * ```
+ *
+ * To get a port that is guaranteed to be in use, pass a function that will be called with the port
+ * number; the port is guaranteed to be in use until the function returns. This may be useful for
+ * example to test for proper error handling when a port is already in use.
+ *
+ * ```ts
+ * const port = await getRandomPort(async (port) => {
+ *     t.throws(
+ *       () => startMyService({ bindAddress: `127.0.0.1:${port}` }),
+ *       {
+ *         instanceOf: Error,
+ *         message: /(Address already in use|socket address)/,
+ *       }
+ *     );
+ *   });
+ * });
+ * ```
+ */
 export async function getRandomPort(fn = (_port: number) => Promise.resolve()): Promise<number> {
   return new Promise<number>((resolve, reject) => {
     const srv = net.createServer();
@@ -308,4 +364,15 @@ export async function loadHistory(fname: string): Promise<iface.temporal.api.his
 export async function saveHistory(fname: string, history: iface.temporal.api.history.v1.IHistory): Promise<void> {
   const fpath = path.resolve(__dirname, `../history_files/${fname}`);
   await fs.writeFile(fpath, historyToJSON(history));
+}
+
+export function approximatelyEqual(
+  a: number | null | undefined,
+  b: number | null | undefined,
+  tolerance = 0.000001
+): boolean {
+  if (a === null || a === undefined || b === null || b === undefined) {
+    return false;
+  }
+  return Math.abs(a - b) < tolerance;
 }

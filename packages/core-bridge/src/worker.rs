@@ -6,20 +6,16 @@ use prost::Message;
 use tokio::sync::mpsc::{Sender, channel};
 use tokio_stream::wrappers::ReceiverStream;
 
-use temporal_sdk_core::{
-    CoreRuntime,
-    api::{
-        Worker as CoreWorkerTrait,
-        errors::{CompleteActivityError, CompleteWfError, PollError},
+use temporalio_common::protos::{
+    coresdk::{
+        ActivityHeartbeat, ActivityTaskCompletion, nexus::NexusTaskCompletion,
+        workflow_completion::WorkflowActivationCompletion,
     },
-    init_replay_worker, init_worker,
-    protos::{
-        coresdk::{
-            ActivityHeartbeat, ActivityTaskCompletion,
-            workflow_completion::WorkflowActivationCompletion,
-        },
-        temporal::api::history::v1::History,
-    },
+    temporal::api::history::v1::History,
+};
+use temporalio_sdk_core::{CompleteActivityError, CompleteNexusError, CompleteWfError, PollError};
+use temporalio_sdk_core::{
+    CoreRuntime, init_replay_worker, init_worker,
     replay::{HistoryForReplay, ReplayWorkerInput},
 };
 
@@ -35,6 +31,7 @@ use crate::{
 pub fn init(cx: &mut ModuleContext) -> NeonResult<()> {
     cx.export_function("newWorker", worker_new)?;
     cx.export_function("workerValidate", worker_validate)?;
+    cx.export_function("workerReplaceClient", worker_replace_client)?;
 
     cx.export_function(
         "workerPollWorkflowActivation",
@@ -52,6 +49,9 @@ pub fn init(cx: &mut ModuleContext) -> NeonResult<()> {
         worker_record_activity_heartbeat,
     )?;
 
+    cx.export_function("workerPollNexusTask", worker_poll_nexus_task)?;
+    cx.export_function("workerCompleteNexusTask", worker_complete_nexus_task)?;
+
     cx.export_function("workerInitiateShutdown", worker_initiate_shutdown)?;
     cx.export_function("workerFinalizeShutdown", worker_finalize_shutdown)?;
 
@@ -67,7 +67,7 @@ pub struct Worker {
     core_runtime: Arc<CoreRuntime>,
 
     // Arc so that we can send reference into async closures
-    core_worker: Arc<temporal_sdk_core::Worker>,
+    core_worker: Arc<temporalio_sdk_core::Worker>,
 }
 
 /// Create a new worker.
@@ -76,16 +76,15 @@ pub fn worker_new(
     client: OpaqueInboundHandle<Client>,
     worker_options: config::BridgeWorkerOptions,
 ) -> BridgeResult<OpaqueOutboundHandle<Worker>> {
-    let config = worker_options
-        .into_core_config()
-        .context("Failed to convert WorkerOptions to CoreWorkerConfig")?;
+    let config = worker_options.into_core_config()?;
 
     let client_ref = client.borrow()?;
-    let client = client_ref.core_client.clone();
+    let connection = client_ref.core_connection.clone();
     let runtime = client_ref.core_runtime.clone();
 
     enter_sync!(runtime);
-    let worker = init_worker(&runtime, config, client).context("Failed to initialize worker")?;
+    let worker =
+        init_worker(&runtime, config, connection).context("Failed to initialize worker")?;
 
     Ok(OpaqueOutboundHandle::new(Worker {
         core_runtime: runtime,
@@ -95,17 +94,40 @@ pub fn worker_new(
 
 /// Validate a worker.
 #[js_function]
-pub fn worker_validate(worker: OpaqueInboundHandle<Worker>) -> BridgeResult<BridgeFuture<()>> {
+pub fn worker_validate(worker: OpaqueInboundHandle<Worker>) -> BridgeResult<BridgeFuture<Vec<u8>>> {
     let worker_ref = worker.borrow()?;
     let worker = worker_ref.core_worker.clone();
     let runtime = worker_ref.core_runtime.clone();
 
     runtime.future_to_promise(async move {
-        worker
-            .validate()
-            .await
-            .map_err(|err| BridgeError::TransportError(err.to_string()))
+        let result = worker.validate().await;
+
+        match result {
+            Ok(task) => Ok(task.encode_to_vec()),
+            Err(err) => Err(BridgeError::TransportError(err.to_string())),
+        }
     })
+}
+
+/// Replace the client used by the worker.
+/// This allows the worker to update client configuration without restarting the worker.
+#[js_function]
+pub fn worker_replace_client(
+    worker: OpaqueInboundHandle<Worker>,
+    client: OpaqueInboundHandle<Client>,
+) -> BridgeResult<()> {
+    let worker_ref = worker.borrow()?;
+    let client_ref = client.borrow()?;
+    let new_connection = client_ref.core_connection.clone();
+    let runtime = worker_ref.core_runtime.clone();
+
+    enter_sync!(runtime);
+    worker_ref
+        .core_worker
+        .replace_client(new_connection)
+        .map_err(|err| BridgeError::UnexpectedError(err.to_string()))?;
+
+    Ok(())
 }
 
 /// Initiate a single workflow activation poll request.
@@ -163,6 +185,9 @@ pub fn worker_complete_workflow_activation(
                             "Malformed Workflow Completion: {reason:?} for RunID={run_id}"
                         ),
                     }
+                }
+                CompleteWfError::WorkflowNotEnabled => {
+                    BridgeError::UnexpectedError(err.to_string())
                 }
             })
     })
@@ -223,6 +248,9 @@ pub fn worker_complete_activity_task(
                     field: None,
                     message: format!("Malformed Activity Completion: {reason:?}"),
                 },
+                CompleteActivityError::ActivityNotEnabled => {
+                    BridgeError::UnexpectedError(err.to_string())
+                }
             })
     })
 }
@@ -247,9 +275,66 @@ pub fn worker_record_activity_heartbeat(
     Ok(())
 }
 
+/// Initiate a single nexus task poll request.
+/// There should be only one concurrent poll request for this type.
+#[js_function]
+pub fn worker_poll_nexus_task(
+    worker: OpaqueInboundHandle<Worker>,
+) -> BridgeResult<BridgeFuture<Vec<u8>>> {
+    let worker_ref = worker.borrow()?;
+    let worker = worker_ref.core_worker.clone();
+    let runtime = worker_ref.core_runtime.clone();
+
+    runtime.future_to_promise(async move {
+        let result = worker.poll_nexus_task().await;
+
+        match result {
+            Ok(task) => Ok(task.encode_to_vec()),
+            Err(err) => match err {
+                PollError::ShutDown => Err(BridgeError::WorkerShutdown)?,
+                PollError::TonicError(status) => {
+                    Err(BridgeError::TransportError(status.message().to_string()))?
+                }
+            },
+        }
+    })
+}
+
+/// Submit an nexus task completion to core.
+#[js_function]
+pub fn worker_complete_nexus_task(
+    worker: OpaqueInboundHandle<Worker>,
+    completion: Vec<u8>,
+) -> BridgeResult<BridgeFuture<()>> {
+    let nexus_completion = NexusTaskCompletion::decode_length_delimited(completion.as_slice())
+        .map_err(|err| BridgeError::TypeError {
+            field: None,
+            message: format!("Cannot decode Completion from buffer: {err:?}"),
+        })?;
+
+    let worker_ref = worker.borrow()?;
+    let worker = worker_ref.core_worker.clone();
+    let runtime = worker_ref.core_runtime.clone();
+
+    runtime.future_to_promise(async move {
+        worker
+            .complete_nexus_task(nexus_completion)
+            .await
+            .map_err(|err| match err {
+                CompleteNexusError::NexusNotEnabled => {
+                    BridgeError::UnexpectedError(err.to_string())
+                }
+                CompleteNexusError::MalformedNexusCompletion { reason } => BridgeError::TypeError {
+                    field: None,
+                    message: format!("Malformed nexus Completion: {reason:?}"),
+                },
+            })
+    })
+}
+
 /// Request shutdown of the worker.
 /// Once complete Core will stop polling on new tasks and activations on worker's task queue.
-/// Caller should drain any pending tasks and activations and call worker_finalize_shutdown before breaking from
+/// Caller should drain any pending tasks and activations and call `worker_finalize_shutdown` before breaking from
 /// the loop to ensure graceful shutdown.
 #[js_function]
 pub fn worker_initiate_shutdown(worker: OpaqueInboundHandle<Worker>) -> BridgeResult<()> {
@@ -340,9 +425,7 @@ pub fn replay_worker_new(
     OpaqueOutboundHandle<Worker>,
     OpaqueOutboundHandle<HistoryForReplayTunnelHandle>,
 )> {
-    let config = config
-        .into_core_config()
-        .context("Failed to convert WorkerOptions to CoreWorkerConfig")?;
+    let config = config.into_core_config()?;
 
     let runtime = runtime.borrow()?.core_runtime.clone();
     enter_sync!(runtime);
@@ -404,28 +487,28 @@ impl MutableFinalize for HistoryForReplayTunnelHandle {}
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 mod config {
+    use std::collections::HashSet;
     use std::{sync::Arc, time::Duration};
-
-    use temporal_sdk_core::{
-        ResourceBasedSlotsOptions, ResourceBasedSlotsOptionsBuilder, ResourceSlotOptions,
-        SlotSupplierOptions as CoreSlotSupplierOptions, TunerHolder, TunerHolderOptionsBuilder,
-        api::worker::{
-            ActivitySlotKind, LocalActivitySlotKind, PollerBehavior as CorePollerBehavior,
-            SlotKind, WorkerConfig, WorkerConfigBuilder, WorkerConfigBuilderError,
-            WorkerDeploymentOptions as CoreWorkerDeploymentOptions,
-            WorkerDeploymentVersion as CoreWorkerDeploymentVersion, WorkflowSlotKind,
-        },
-        protos::temporal::api::enums::v1::VersioningBehavior as CoreVersioningBehavior,
+    use temporalio_common::protos::temporal::api::enums::v1::VersioningBehavior as CoreVersioningBehavior;
+    use temporalio_common::protos::temporal::api::worker::v1::PluginInfo;
+    use temporalio_common::worker::{
+        WorkerDeploymentOptions as CoreWorkerDeploymentOptions,
+        WorkerDeploymentVersion as CoreWorkerDeploymentVersion,
+    };
+    use temporalio_sdk_core::{
+        ActivitySlotKind, LocalActivitySlotKind, NexusSlotKind,
+        PollerBehavior as CorePollerBehavior, ResourceBasedSlotsOptions, ResourceSlotOptions,
+        SlotKind, SlotSupplierOptions as CoreSlotSupplierOptions, TunerHolder, TunerHolderOptions,
+        WorkerConfig, WorkerVersioningStrategy, WorkflowSlotKind,
     };
 
     use super::custom_slot_supplier::CustomSlotSupplierOptions;
-    use crate::helpers::TryIntoJs;
+    use crate::helpers::{BridgeError, TryIntoJs};
     use bridge_macros::TryFromJs;
     use neon::context::Context;
     use neon::object::Object;
     use neon::prelude::JsResult;
     use neon::types::JsObject;
-    use temporal_sdk_core::api::worker::WorkerVersioningStrategy;
 
     #[derive(TryFromJs)]
     pub struct BridgeWorkerOptions {
@@ -439,7 +522,8 @@ mod config {
         non_sticky_to_sticky_poll_ratio: f32,
         workflow_task_poller_behavior: PollerBehavior,
         activity_task_poller_behavior: PollerBehavior,
-        enable_non_local_activities: bool,
+        nexus_task_poller_behavior: PollerBehavior,
+        task_types: WorkerTaskTypes,
         sticky_queue_schedule_to_start_timeout: Duration,
         max_cached_workflows: usize,
         max_heartbeat_throttle_interval: Duration,
@@ -447,6 +531,7 @@ mod config {
         max_activities_per_second: Option<f64>,
         max_task_queue_activities_per_second: Option<f64>,
         shutdown_grace_time: Option<Duration>,
+        plugins: Vec<String>,
     }
 
     #[derive(TryFromJs)]
@@ -465,7 +550,7 @@ mod config {
     pub struct WorkerDeploymentOptions {
         version: WorkerDeploymentVersion,
         use_worker_versioning: bool,
-        default_versioning_behavior: VersioningBehavior,
+        default_versioning_behavior: Option<VersioningBehavior>,
     }
 
     #[derive(TryFromJs)]
@@ -480,12 +565,31 @@ mod config {
         AutoUpgrade,
     }
 
+    #[derive(TryFromJs)]
+    #[allow(clippy::struct_excessive_bools)]
+    pub struct WorkerTaskTypes {
+        enable_workflows: bool,
+        enable_local_activities: bool,
+        enable_remote_activities: bool,
+        enable_nexus: bool,
+    }
+
+    impl From<WorkerTaskTypes> for temporalio_common::worker::WorkerTaskTypes {
+        fn from(t: WorkerTaskTypes) -> Self {
+            Self {
+                enable_workflows: t.enable_workflows,
+                enable_local_activities: t.enable_local_activities,
+                enable_remote_activities: t.enable_remote_activities,
+                enable_nexus: t.enable_nexus,
+            }
+        }
+    }
+
     impl BridgeWorkerOptions {
-        pub(crate) fn into_core_config(self) -> Result<WorkerConfig, WorkerConfigBuilderError> {
+        pub(crate) fn into_core_config(self) -> Result<WorkerConfig, BridgeError> {
             // Set all other options
-            let mut builder = WorkerConfigBuilder::default();
-            builder
-                .client_identity_override(Some(self.identity))
+            WorkerConfig::builder()
+                .maybe_client_identity_override(Some(self.identity))
                 .versioning_strategy({
                     if let Some(dopts) = self.worker_deployment_options {
                         WorkerVersioningStrategy::WorkerDeploymentBased(dopts.into())
@@ -503,17 +607,33 @@ mod config {
                 .namespace(self.namespace)
                 .tuner(self.tuner.into_core_config()?)
                 .nonsticky_to_sticky_poll_ratio(self.non_sticky_to_sticky_poll_ratio)
-                .workflow_task_poller_behavior(self.workflow_task_poller_behavior)
-                .activity_task_poller_behavior(self.activity_task_poller_behavior)
-                .no_remote_activities(!self.enable_non_local_activities)
+                .workflow_task_poller_behavior(self.workflow_task_poller_behavior.into())
+                .activity_task_poller_behavior(self.activity_task_poller_behavior.into())
+                .nexus_task_poller_behavior(self.nexus_task_poller_behavior.into())
+                .task_types(self.task_types.into())
                 .sticky_queue_schedule_to_start_timeout(self.sticky_queue_schedule_to_start_timeout)
                 .max_cached_workflows(self.max_cached_workflows)
                 .max_heartbeat_throttle_interval(self.max_heartbeat_throttle_interval)
                 .default_heartbeat_throttle_interval(self.default_heartbeat_throttle_interval)
-                .max_task_queue_activities_per_second(self.max_task_queue_activities_per_second)
-                .max_worker_activities_per_second(self.max_activities_per_second)
-                .graceful_shutdown_period(self.shutdown_grace_time)
+                .maybe_max_task_queue_activities_per_second(
+                    self.max_task_queue_activities_per_second,
+                )
+                .maybe_max_worker_activities_per_second(self.max_activities_per_second)
+                .maybe_graceful_shutdown_period(self.shutdown_grace_time)
+                .plugins(
+                    self.plugins
+                        .into_iter()
+                        .map(|name| PluginInfo {
+                            name,
+                            version: String::new(),
+                        })
+                        .collect::<HashSet<_>>(),
+                )
                 .build()
+                .map_err(|err| BridgeError::TypeError {
+                    message: format!("Failed to convert WorkerOptions to CoreWorkerConfig: {err}"),
+                    field: None,
+                })
         }
     }
 
@@ -539,7 +659,7 @@ mod config {
             Self {
                 version: val.version.into(),
                 use_worker_versioning: val.use_worker_versioning,
-                default_versioning_behavior: Some(val.default_versioning_behavior.into()),
+                default_versioning_behavior: val.default_versioning_behavior.map(Into::into),
             }
         }
     }
@@ -590,33 +710,33 @@ mod config {
         workflow_task_slot_supplier: SlotSupplier<WorkflowSlotKind>,
         activity_task_slot_supplier: SlotSupplier<ActivitySlotKind>,
         local_activity_task_slot_supplier: SlotSupplier<LocalActivitySlotKind>,
+        nexus_task_slot_supplier: SlotSupplier<NexusSlotKind>,
     }
 
     impl WorkerTuner {
-        fn into_core_config(self) -> Result<Arc<TunerHolder>, String> {
-            let mut tuner_holder = TunerHolderOptionsBuilder::default();
+        fn into_core_config(self) -> Result<Arc<TunerHolder>, BridgeError> {
             let mut rbo = None;
-
-            tuner_holder.workflow_slot_options(
-                self.workflow_task_slot_supplier
-                    .into_slot_supplier(&mut rbo),
-            );
-            tuner_holder.activity_slot_options(
-                self.activity_task_slot_supplier
-                    .into_slot_supplier(&mut rbo),
-            );
-            tuner_holder.local_activity_slot_options(
-                self.local_activity_task_slot_supplier
-                    .into_slot_supplier(&mut rbo),
-            );
-            if let Some(rbo) = rbo {
-                tuner_holder.resource_based_options(rbo);
-            }
-
-            tuner_holder
+            TunerHolderOptions::builder()
+                .workflow_slot_options(
+                    self.workflow_task_slot_supplier
+                        .into_slot_supplier(&mut rbo),
+                )
+                .activity_slot_options(
+                    self.activity_task_slot_supplier
+                        .into_slot_supplier(&mut rbo),
+                )
+                .local_activity_slot_options(
+                    self.local_activity_task_slot_supplier
+                        .into_slot_supplier(&mut rbo),
+                )
+                .nexus_slot_options(self.nexus_task_slot_supplier.into_slot_supplier(&mut rbo))
+                .maybe_resource_based_options(rbo)
                 .build_tuner_holder()
                 .map(Arc::new)
-                .map_err(|e| format!("Invalid tuner options: {e:?}"))
+                .map_err(|err| BridgeError::TypeError {
+                    message: format!("Invalid tuner options: {err}"),
+                    field: None,
+                })
         }
     }
 
@@ -657,11 +777,10 @@ mod config {
                 },
                 Self::ResourceBased(opts) => {
                     *rbo = Some(
-                        ResourceBasedSlotsOptionsBuilder::default()
+                        ResourceBasedSlotsOptions::builder()
                             .target_cpu_usage(opts.tuner_options.target_cpu_usage)
                             .target_mem_usage(opts.tuner_options.target_memory_usage)
-                            .build()
-                            .expect("Building ResourceBasedSlotsOptions can't fail"),
+                            .build(),
                     );
                     CoreSlotSupplierOptions::ResourceBased(ResourceSlotOptions::new(
                         opts.minimum_slots,
@@ -684,15 +803,13 @@ mod custom_slot_supplier {
 
     use neon::{context::Context, handle::Handle, prelude::*};
 
-    use temporal_sdk_core::{
+    use temporalio_sdk_core::{
+        SlotInfo as CoreSlotInfo, SlotInfoTrait as _, SlotKind, SlotKindType as CoreSlotKindType,
+        SlotMarkUsedContext as CoreSlotMarkUsedContext,
+        SlotReleaseContext as CoreSlotReleaseContext,
+        SlotReservationContext as CoreSlotReservationContext, SlotSupplier as CoreSlotSupplier,
         SlotSupplierOptions as CoreSlotSupplierOptions,
-        api::worker::{
-            SlotInfo as CoreSlotInfo, SlotInfoTrait as _, SlotKind,
-            SlotKindType as CoreSlotKindType, SlotMarkUsedContext as CoreSlotMarkUsedContext,
-            SlotReleaseContext as CoreSlotReleaseContext,
-            SlotReservationContext as CoreSlotReservationContext, SlotSupplier as CoreSlotSupplier,
-            SlotSupplierPermit as CoreSlotSupplierPermit,
-        },
+        SlotSupplierPermit as CoreSlotSupplierPermit,
     };
 
     use bridge_macros::{TryFromJs, TryIntoJs};
@@ -752,7 +869,6 @@ mod custom_slot_supplier {
                     Err(err) => {
                         warn!("Error reserving slot: {err:?}");
                         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-                        continue;
                     }
                 }
             }
@@ -876,18 +992,18 @@ mod custom_slot_supplier {
         fn from(info: &'a CoreSlotInfo<'a>) -> Self {
             match info {
                 CoreSlotInfo::Workflow(info) => Self::Workflow {
-                    workflow_type: info.workflow_type.to_string(),
+                    workflow_type: info.workflow_type.clone(),
                     is_sticky: info.is_sticky,
                 },
                 CoreSlotInfo::Activity(info) => Self::Activity {
-                    activity_type: info.activity_type.to_string(),
+                    activity_type: info.activity_type.clone(),
                 },
                 CoreSlotInfo::LocalActivity(info) => Self::LocalActivity {
-                    activity_type: info.activity_type.to_string(),
+                    activity_type: info.activity_type.clone(),
                 },
                 CoreSlotInfo::Nexus(info) => Self::Nexus {
-                    service: info.service.to_string(),
-                    operation: info.operation.to_string(),
+                    service: info.service.clone(),
+                    operation: info.operation.clone(),
                 },
             }
         }

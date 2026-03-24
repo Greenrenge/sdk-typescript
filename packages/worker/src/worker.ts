@@ -19,6 +19,7 @@ import {
 } from 'rxjs';
 import { delay, filter, first, ignoreElements, last, map, mergeMap, takeUntil, takeWhile, tap } from 'rxjs/operators';
 import type { RawSourceMap } from 'source-map';
+import * as nexus from 'nexus-rpc';
 import { Info as ActivityInfo } from '@temporalio/activity';
 import {
   DataConverter,
@@ -32,7 +33,9 @@ import {
   ensureApplicationFailure,
   TypedSearchAttributes,
   decodePriority,
+  CancelledFailure,
   MetricMeter,
+  ActivityCancellationDetails,
 } from '@temporalio/common';
 import {
   decodeArrayFromPayloads,
@@ -55,9 +58,11 @@ import { LoggerWithComposedMetadata } from '@temporalio/common/lib/logger';
 import { errorMessage, NonNullableObject, OmitFirstParam } from '@temporalio/common/lib/type-helpers';
 import { workflowLogAttributes } from '@temporalio/workflow/lib/logs';
 import { native } from '@temporalio/core-bridge';
+import { Client } from '@temporalio/client';
 import { coresdk, temporal } from '@temporalio/proto';
 import { type SinkCall, type WorkflowInfo } from '@temporalio/workflow';
 import { throwIfReservedName } from '@temporalio/common/lib/reserved';
+import { suggestContinueAsNewReasonsFromProto } from '@temporalio/common/lib/continue-as-new';
 import { Activity, CancelReason, activityLogAttributes } from './activity';
 import { extractNativeClient, extractReferenceHolders, InternalNativeConnection, NativeConnection } from './connection';
 import { ActivityExecuteInput } from './interceptors';
@@ -87,6 +92,7 @@ import {
   ReplayWorkerOptions,
   toNativeWorkerOptions,
   WorkerOptions,
+  WorkerPlugin,
   WorkflowBundle,
 } from './worker-options';
 import { WorkflowCodecRunner } from './workflow-codec-runner';
@@ -103,6 +109,8 @@ import {
   ShutdownError,
   UnexpectedError,
 } from './errors';
+import { constructNexusOperationContext, NexusHandler } from './nexus';
+import { handlerErrorToProto } from './nexus/conversions';
 
 export { DataConverter, defaultPayloadConverter };
 
@@ -129,6 +137,15 @@ export type ActivityTaskWithBase64Token = {
   protobufEncodedTask: Buffer;
 };
 
+export type NexusTaskWithBase64Token = {
+  task: coresdk.nexus.NexusTask;
+  base64TaskToken: string;
+
+  // The unaltered protobuf-encoded NexusTask; kept so that it can be printed
+  // out for analysis if decoding fails at a later step.
+  protobufEncodedTask: Buffer;
+};
+
 interface EvictionWithRunID {
   runId: string;
   evictJob: coresdk.workflow_activation.IRemoveFromCache;
@@ -141,9 +158,12 @@ export interface NativeWorkerLike {
   flushCoreLogs(): void;
   pollWorkflowActivation: OmitFirstParam<typeof native.workerPollWorkflowActivation>;
   pollActivityTask: OmitFirstParam<typeof native.workerPollActivityTask>;
+  pollNexusTask: OmitFirstParam<typeof native.workerPollNexusTask>;
   completeWorkflowActivation: OmitFirstParam<typeof native.workerCompleteWorkflowActivation>;
   completeActivityTask: OmitFirstParam<typeof native.workerCompleteActivityTask>;
+  completeNexusTask: OmitFirstParam<typeof native.workerCompleteNexusTask>;
   recordActivityHeartbeat: OmitFirstParam<typeof native.workerRecordActivityHeartbeat>;
+  replaceClient: OmitFirstParam<typeof native.workerReplaceClient>;
 }
 
 export interface NativeReplayHandle {
@@ -166,7 +186,7 @@ interface WorkflowWithLogAttributes {
 }
 
 function addBuildIdIfMissing(options: CompiledWorkerOptions, bundleCode?: string): CompiledWorkerOptionsWithBuildId {
-  const bid = options.buildId; // eslint-disable-line deprecation/deprecation
+  const bid = options.buildId; // eslint-disable-line @typescript-eslint/no-deprecated
   if (bid != null) {
     return options as CompiledWorkerOptionsWithBuildId;
   }
@@ -176,10 +196,13 @@ function addBuildIdIfMissing(options: CompiledWorkerOptions, bundleCode?: string
 
 export class NativeWorker implements NativeWorkerLike {
   public readonly type = 'worker';
+  public readonly replaceClient: OmitFirstParam<typeof native.workerReplaceClient>;
   public readonly pollWorkflowActivation: OmitFirstParam<typeof native.workerPollWorkflowActivation>;
   public readonly pollActivityTask: OmitFirstParam<typeof native.workerPollActivityTask>;
+  public readonly pollNexusTask: OmitFirstParam<typeof native.workerPollNexusTask>;
   public readonly completeWorkflowActivation: OmitFirstParam<typeof native.workerCompleteWorkflowActivation>;
   public readonly completeActivityTask: OmitFirstParam<typeof native.workerCompleteActivityTask>;
+  public readonly completeNexusTask: OmitFirstParam<typeof native.workerCompleteNexusTask>;
   public readonly recordActivityHeartbeat: OmitFirstParam<typeof native.workerRecordActivityHeartbeat>;
   public readonly initiateShutdown: OmitFirstParam<typeof native.workerInitiateShutdown>;
 
@@ -207,10 +230,13 @@ export class NativeWorker implements NativeWorkerLike {
     protected readonly runtime: Runtime,
     protected readonly nativeWorker: native.Worker
   ) {
+    this.replaceClient = native.workerReplaceClient.bind(undefined, nativeWorker);
     this.pollWorkflowActivation = native.workerPollWorkflowActivation.bind(undefined, nativeWorker);
     this.pollActivityTask = native.workerPollActivityTask.bind(undefined, nativeWorker);
+    this.pollNexusTask = native.workerPollNexusTask.bind(undefined, nativeWorker);
     this.completeWorkflowActivation = native.workerCompleteWorkflowActivation.bind(undefined, nativeWorker);
     this.completeActivityTask = native.workerCompleteActivityTask.bind(undefined, nativeWorker);
+    this.completeNexusTask = native.workerCompleteNexusTask.bind(undefined, nativeWorker);
     this.recordActivityHeartbeat = native.workerRecordActivityHeartbeat.bind(undefined, nativeWorker);
     this.initiateShutdown = native.workerInitiateShutdown.bind(undefined, nativeWorker);
   }
@@ -437,6 +463,8 @@ export class Worker {
 
   protected readonly workflowPollerStateSubject = new BehaviorSubject<PollerState>('POLLING');
   protected readonly activityPollerStateSubject = new BehaviorSubject<PollerState>('POLLING');
+  protected readonly nexusPollerStateSubject = new BehaviorSubject<PollerState>('POLLING');
+
   /**
    * Whether or not this worker has an outstanding workflow poll request
    */
@@ -445,14 +473,23 @@ export class Worker {
    * Whether or not this worker has an outstanding activity poll request
    */
   protected hasOutstandingActivityPoll = false;
+  /**
+   * Whether or not this worker has an outstanding Nexus poll request
+   */
+  protected hasOutstandingNexusPoll = false;
+
+  protected _client?: Client;
 
   protected readonly numInFlightActivationsSubject = new BehaviorSubject<number>(0);
   protected readonly numInFlightActivitiesSubject = new BehaviorSubject<number>(0);
   protected readonly numInFlightNonLocalActivitiesSubject = new BehaviorSubject<number>(0);
   protected readonly numInFlightLocalActivitiesSubject = new BehaviorSubject<number>(0);
+  protected readonly numInFlightNexusOperationsSubject = new BehaviorSubject<number>(0);
   protected readonly numCachedWorkflowsSubject = new BehaviorSubject<number>(0);
   protected readonly numHeartbeatingActivitiesSubject = new BehaviorSubject<number>(0);
   protected readonly evictionsEmitter = new EventEmitter();
+
+  private readonly taskTokenToNexusHandler = new Map<string, NexusHandler>();
 
   protected static nativeWorkerCtor: NativeWorkerConstructor = NativeWorker;
   // Used to add uniqueness to replay worker task queue names
@@ -468,6 +505,12 @@ export class Worker {
    * This method initiates a connection to the server and will throw (asynchronously) on connection failure.
    */
   public static async create(options: WorkerOptions): Promise<Worker> {
+    options.plugins = (options.plugins ?? []).concat(options.connection?.plugins ?? []);
+    for (const plugin of options.plugins) {
+      if (plugin.configureWorker !== undefined) {
+        options = plugin.configureWorker(options);
+      }
+    }
     if (!options.taskQueue) {
       throw new TypeError('Task queue name is required');
     }
@@ -523,6 +566,7 @@ export class Worker {
       compiledOptionsWithBuildId,
       logger,
       metricMeter,
+      options.plugins ?? [],
       connection
     );
   }
@@ -665,6 +709,12 @@ export class Worker {
   }
 
   private static async constructReplayWorker(options: ReplayWorkerOptions): Promise<[Worker, native.HistoryPusher]> {
+    const plugins = options.plugins ?? [];
+    for (const plugin of plugins) {
+      if (plugin.configureReplayWorker !== undefined) {
+        options = plugin.configureReplayWorker(options);
+      }
+    }
     const nativeWorkerCtor: NativeWorkerConstructor = this.nativeWorkerCtor;
     const fixedUpOptions: WorkerOptions = {
       taskQueue: (options.replayName ?? 'fake_replay_queue') + '-' + this.replayWorkerCount,
@@ -692,7 +742,17 @@ export class Worker {
       addBuildIdIfMissing(compiledOptions, bundle.code)
     );
     return [
-      new this(runtime, replayHandle.worker, workflowCreator, compiledOptions, logger, metricMeter, undefined, true),
+      new this(
+        runtime,
+        replayHandle.worker,
+        workflowCreator,
+        compiledOptions,
+        logger,
+        metricMeter,
+        plugins,
+        undefined,
+        true
+      ),
       replayHandle.historyPusher,
     ];
   }
@@ -738,6 +798,7 @@ export class Worker {
         payloadConverterPath: compiledOptions.dataConverter?.payloadConverterPath,
         ignoreModules: compiledOptions.bundlerOptions?.ignoreModules,
         webpackConfigHook: compiledOptions.bundlerOptions?.webpackConfigHook,
+        plugins: compiledOptions.plugins,
       });
       const bundle = await bundler.createBundle();
       return parseWorkflowCode(bundle.code);
@@ -760,7 +821,8 @@ export class Worker {
     /** Logger bound to 'sdkComponent: worker' */
     protected readonly logger: Logger,
     protected readonly metricMeter: MetricMeter,
-    protected readonly connection?: NativeConnection,
+    protected readonly plugins: WorkerPlugin[],
+    protected _connection?: NativeConnection,
     protected readonly isReplayWorker: boolean = false
   ) {
     this.workflowCodecRunner = new WorkflowCodecRunner(options.loadedDataConverter.payloadCodecs);
@@ -812,6 +874,72 @@ export class Worker {
       numInFlightNonLocalActivities: this.numInFlightNonLocalActivitiesSubject.value,
       numInFlightLocalActivities: this.numInFlightLocalActivitiesSubject.value,
     };
+  }
+
+  /**
+   * Get the client associated with this Worker.
+   *
+   * Returns undefined if the worker was created without a connection (e.g., replay workers).
+   */
+  public get client(): Client | undefined {
+    // Lazily create the client if it's not already set. Note that _connection
+    // (and consequently _client) will be set IIF this is not a replay worker.
+    if (this._client == null && this._connection != null) {
+      this._client = new Client({
+        namespace: this.options.namespace,
+        connection: this._connection,
+        identity: this.options.identity,
+        dataConverter: this.options.dataConverter,
+        interceptors: this.options.interceptors.client,
+      });
+    }
+
+    return this._client;
+  }
+
+  /**
+   * Get the connection associated with this Worker.
+   * Returns undefined if the worker was created without a connection (e.g., replay workers).
+   */
+  public get connection(): NativeConnection | undefined {
+    return this._connection;
+  }
+
+  /**
+   * Replace the connection used by this Worker.
+   * This allows the worker to switch to a different Temporal server or update connection configuration
+   * without restarting the worker.
+   *
+   * @remarks
+   * The worker must have been created with a connection for this method to work.
+   * Subsequent calls by the worker to Temporal (e.g., responding to tasks) will use the new connection.
+   * A new client will be created automatically from the provided connection.
+   *
+   * @param newConnection - The new NativeConnection to use
+   * @throws {IllegalStateError} If the worker was created without a connection
+   * @throws {Error} If the connection replacement fails
+   */
+  public set connection(newConnection: NativeConnection) {
+    if (!this._connection) throw new IllegalStateError('Cannot replace connection on a worker without a connection');
+    if (extractNativeClient(this._connection) === extractNativeClient(newConnection)) return;
+
+    const previousConnection = this._connection;
+
+    // Call the native bridge to replace the client
+    this.nativeWorker.replaceClient(extractNativeClient(newConnection));
+
+    extractReferenceHolders(previousConnection).delete(this.nativeWorker);
+    this._connection = newConnection;
+    extractReferenceHolders(newConnection).add(this.nativeWorker);
+
+    // Clear up the cached client, if any. It will be lazily recreated on demand.
+    this._client = undefined;
+
+    if (previousConnection instanceof InternalNativeConnection) {
+      previousConnection.close().catch((err) => {
+        this.logger.error('Error closing previous connection after replacement of worker connection', { err });
+      });
+    }
   }
 
   protected get state(): State {
@@ -993,9 +1121,15 @@ export class Worker {
                           base64TaskToken,
                           details,
                           onError() {
-                            activity?.cancel('HEARTBEAT_DETAILS_CONVERSION_FAILED'); // activity must be defined
+                            // activity must be defined
+                            // empty cancellation details, no corresponding detail for heartbeat detail conversion failure
+                            activity?.cancel(
+                              'HEARTBEAT_DETAILS_CONVERSION_FAILED',
+                              ActivityCancellationDetails.fromProto(undefined)
+                            );
                           },
                         }),
+                      this.client,
                       this.logger,
                       this.metricMeter,
                       this.options.interceptors.activity
@@ -1032,11 +1166,15 @@ export class Worker {
                   // NOTE: activity will not be considered cancelled until it confirms cancellation (by throwing a CancelledFailure)
                   this.logger.trace('Cancelling activity', activityLogAttributes(activity.info));
                   const reason = task.cancel?.reason;
+                  const cancellationDetails = task.cancel?.details;
                   if (reason === undefined || reason === null) {
                     // Special case of Lang side cancellation during shutdown (see `activity.shutdown.evict` above)
-                    activity.cancel('WORKER_SHUTDOWN');
+                    activity.cancel('WORKER_SHUTDOWN', ActivityCancellationDetails.fromProto(cancellationDetails));
                   } else {
-                    activity.cancel(coresdk.activity_task.ActivityCancelReason[reason] as CancelReason);
+                    activity.cancel(
+                      coresdk.activity_task.ActivityCancelReason[reason] as CancelReason,
+                      ActivityCancellationDetails.fromProto(cancellationDetails)
+                    );
                   }
                   break;
                 }
@@ -1117,6 +1255,104 @@ export class Worker {
   }
 
   /**
+   * Process Nexus tasks
+   */
+  protected nexusOperator(): OperatorFunction<NexusTaskWithBase64Token, Uint8Array> {
+    return pipe(
+      mergeMap(
+        async ({
+          task,
+          base64TaskToken,
+          protobufEncodedTask,
+        }): Promise<coresdk.nexus.INexusTaskCompletion | undefined> => {
+          const { variant } = task;
+          if (!variant) {
+            throw new TypeError('Got a nexus task without a "variant" attribute');
+          }
+
+          switch (variant) {
+            case 'task': {
+              if (task.task == null) {
+                throw new IllegalStateError(`Got empty task for task variant with token: ${base64TaskToken}`);
+              }
+              return await this.handleNexusRunTask(task.task, base64TaskToken, protobufEncodedTask);
+            }
+            case 'cancelTask': {
+              const nexusHandler = this.taskTokenToNexusHandler.get(base64TaskToken);
+              if (nexusHandler == null) {
+                this.logger.trace('Tried to cancel a non-existing Nexus handler', {
+                  taskToken: base64TaskToken,
+                });
+                break;
+              }
+              // NOTE: Nexus handler will not be considered cancelled until it confirms cancellation (by throwing a CancelledFailure)
+              this.logger.trace('Cancelling Nexus handler', nexusHandler.getLogAttributes());
+              let reason = 'unkown';
+              if (task.cancelTask?.reason != null) {
+                reason = coresdk.nexus.NexusTaskCancelReason[task.cancelTask.reason];
+              }
+              nexusHandler.abortController.abort(new CancelledFailure(reason));
+              return;
+            }
+          }
+        }
+      ),
+      filter(<T>(result: T): result is Exclude<T, undefined> => result !== undefined),
+      map((result) => coresdk.nexus.NexusTaskCompletion.encodeDelimited(result).finish())
+    );
+  }
+
+  private async handleNexusRunTask(
+    task: temporal.api.workflowservice.v1.IPollNexusTaskQueueResponse,
+    base64TaskToken: string,
+    protobufEncodedTask: ArrayBuffer
+  ) {
+    const { taskToken } = task;
+    if (taskToken == null) {
+      throw new nexus.HandlerError('INTERNAL', 'Task missing request task token');
+    }
+
+    let nexusHandler: NexusHandler | undefined = undefined;
+    try {
+      const abortController = new AbortController();
+
+      nexusHandler = new NexusHandler(
+        taskToken,
+        this.options.namespace,
+        this.options.taskQueue,
+        constructNexusOperationContext(task.request, abortController.signal),
+        this.client!, // Must be defined if we are handling Nexus tasks.
+        abortController,
+        this.options.nexusServiceRegistry!, // Must be defined if we are handling Nexus tasks.
+        this.options.loadedDataConverter,
+        this.logger,
+        this.metricMeter,
+        this.options.interceptors.nexus
+      );
+      this.taskTokenToNexusHandler.set(base64TaskToken, nexusHandler);
+      this.numInFlightNexusOperationsSubject.next(this.numInFlightNexusOperationsSubject.value + 1);
+      try {
+        return await nexusHandler.run(task);
+      } finally {
+        this.numInFlightNexusOperationsSubject.next(this.numInFlightNexusOperationsSubject.value - 1);
+        this.taskTokenToNexusHandler.delete(base64TaskToken);
+      }
+    } catch (e) {
+      this.logger.error(`Error while processing Nexus task: ${errorMessage(e)}`, {
+        ...(nexusHandler?.getLogAttributes() ?? {}),
+        error: e,
+        taskEncoded: Buffer.from(protobufEncodedTask).toString('base64'),
+      });
+      const handlerError =
+        e instanceof nexus.HandlerError ? e : new nexus.HandlerError('INTERNAL', undefined, { cause: e });
+      return {
+        taskToken,
+        error: await handlerErrorToProto(this.options.loadedDataConverter, handlerError),
+      };
+    }
+  }
+
+  /**
    * Process activations from the same workflow execution to an observable of completions.
    *
    * Injects a synthetic eviction activation when the worker transitions to no longer polling.
@@ -1171,7 +1407,7 @@ export class Worker {
       const close = removeFromCacheIx !== -1;
       const jobs = activation.jobs;
       if (close) {
-        const asEvictJob = jobs.splice(removeFromCacheIx, 1)[0].removeFromCache;
+        const asEvictJob = jobs.splice(removeFromCacheIx, 1)[0]!.removeFromCache;
         if (asEvictJob) {
           this.evictionsEmitter.emit('eviction', {
             runId: activation.runId,
@@ -1224,12 +1460,10 @@ export class Worker {
           // When processing workflows through runReplayHistories, Core may still send non-replay
           // activations on the very last Workflow Task in some cases. Though Core is technically exact
           // here, the fact that sinks marked with callDuringReplay = false may get called on a replay
-          // worker is definitely a surprising behavior. For that reason, we extend the isReplaying flag in
-          // this case to also include anything running under in a replay worker.
-          const isReplaying = activation.isReplaying || this.isReplayWorker;
-
+          // worker is definitely a surprising behavior. For that reason, processSinkCalls checks
+          // this.isReplayWorker to suppress all non-callDuringReplay sinks on replay workers.
           const calls = await workflow.workflow.getAndResetSinkCalls();
-          await this.processSinkCalls(calls, isReplaying, workflow.logAttributes);
+          await this.processSinkCalls(calls, workflow.logAttributes);
         }
         this.logger.trace('Completed activation', workflow.logAttributes);
       }
@@ -1266,7 +1500,6 @@ export class Worker {
     activation: Decoded<coresdk.workflow_activation.WorkflowActivation>,
     initWorkflowJob: Decoded<coresdk.workflow_activation.IInitializeWorkflow>
   ): Promise<WorkflowWithLogAttributes> {
-    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
     const workflowCreator = this.workflowCreator!;
     if (
       !(
@@ -1332,11 +1565,14 @@ export class Worker {
       // A zero value means that it was not set by the server
       historySize: activation.historySizeBytes.toNumber(),
       continueAsNewSuggested: activation.continueAsNewSuggested,
+      targetWorkerDeploymentVersionChanged: activation.targetWorkerDeploymentVersionChanged ?? false,
+      suggestedContinueAsNewReasons: suggestContinueAsNewReasonsFromProto(activation.suggestContinueAsNewReasons),
       currentBuildId: activation.deploymentVersionForCurrentTask?.buildId ?? '',
       currentDeploymentVersion: convertDeploymentVersion(activation.deploymentVersionForCurrentTask),
       unsafe: {
         now: () => Date.now(), // re-set in initRuntime
         isReplaying: activation.isReplaying,
+        isReplayingHistoryEvents: activation.isReplaying,
       },
       priority: decodePriority(priority),
     };
@@ -1362,11 +1598,7 @@ export class Worker {
    * This function does not throw, it will log in case of missing sinks
    * or failed sink function invocations.
    */
-  protected async processSinkCalls(
-    externalCalls: SinkCall[],
-    isReplaying: boolean,
-    logAttributes: Record<string, unknown>
-  ): Promise<void> {
+  protected async processSinkCalls(externalCalls: SinkCall[], logAttributes: Record<string, unknown>): Promise<void> {
     const { sinks } = this.options;
 
     const filteredCalls = externalCalls
@@ -1384,8 +1616,15 @@ export class Worker {
         });
         return false;
       })
-      // If appropriate, reject calls to sink functions not configured with `callDuringReplay = true`
-      .filter(({ sink }) => sink?.callDuringReplay || !isReplaying);
+      // If appropriate, reject calls to sink functions not configured with `callDuringReplay = true`.
+      // Use per-call isReplayingHistoryEvents (which is false during queries and update validators)
+      // rather than per-activation isReplaying, so that logging is permitted during live read-only operations.
+      // Replay workers still suppress all non-callDuringReplay sinks regardless.
+      .filter(({ call, sink }) => {
+        if (sink?.callDuringReplay) return true;
+        if (this.isReplayWorker) return false;
+        return !call.workflowInfo.unsafe.isReplayingHistoryEvents;
+      });
 
     // Make a wrapper function, to make things easier afterward
     await Promise.all(
@@ -1661,6 +1900,54 @@ export class Worker {
     );
   }
 
+  protected nexusPoll$(): Observable<NexusTaskWithBase64Token> {
+    return this.pollLoop$(async () => {
+      this.hasOutstandingNexusPoll = true;
+      let buffer: Buffer;
+      try {
+        buffer = await this.nativeWorker.pollNexusTask();
+      } finally {
+        this.hasOutstandingNexusPoll = false;
+      }
+      const task = coresdk.nexus.NexusTask.decode(new Uint8Array(buffer));
+      const taskToken = task.task?.taskToken || task.cancelTask?.taskToken;
+      if (taskToken == null) {
+        throw new TypeError('Got a Nexus task without a task token');
+      }
+      const base64TaskToken = formatTaskToken(taskToken);
+      this.logger.trace('Got Nexus task', {
+        taskToken: base64TaskToken,
+        ...task,
+      });
+      return { task, base64TaskToken, protobufEncodedTask: buffer };
+    }).pipe(
+      tap({
+        complete: () => {
+          this.nexusPollerStateSubject.next('SHUTDOWN');
+        },
+        error: () => {
+          this.nexusPollerStateSubject.next('FAILED');
+        },
+      })
+    );
+  }
+
+  protected nexus$(): Observable<void> {
+    // This Worker did not register any Nexus services, return early.
+    if (this.options.nexusServiceRegistry == null) {
+      if (!this.isReplayWorker) this.logger.info('No Nexus services registered, not polling for Nexus tasks');
+      this.nexusPollerStateSubject.next('SHUTDOWN');
+      return EMPTY;
+    }
+    return this.nexusPoll$().pipe(
+      this.nexusOperator(),
+      mergeMap(async (completion) => {
+        await this.nativeWorker.completeNexusTask(Buffer.from(completion.buffer, completion.byteOffset));
+      }),
+      tap({ complete: () => this.logger.debug('Nexus Worker terminated') })
+    );
+  }
+
   protected takeUntilState<T>(state: State): MonoTypeOperatorFunction<T> {
     return takeUntil(this.stateSubject.pipe(filter((value) => value === state)));
   }
@@ -1758,6 +2045,21 @@ export class Worker {
    * To stop polling, call {@link shutdown} or send one of {@link Runtime.options.shutdownSignals}.
    */
   async run(): Promise<void> {
+    if (this.isReplayWorker) {
+      return this.runInternal();
+    }
+    let runWorker = (w: Worker) => w.runInternal();
+    for (let i = this.plugins.length - 1; i >= 0; --i) {
+      const rw = runWorker;
+      const plugin = this.plugins[i];
+      if (plugin?.runWorker !== undefined) {
+        runWorker = (w: Worker) => plugin.runWorker!(w, rw);
+      }
+    }
+    return runWorker(this);
+  }
+
+  private async runInternal(): Promise<void> {
     if (this.state !== 'INITIALIZED') {
       throw new IllegalStateError('Poller was already started');
     }
@@ -1785,7 +2087,7 @@ export class Worker {
             this.instantTerminateErrorSubject.pipe(this.takeUntilState('DRAINED')),
             this.forceShutdown$(),
             this.activityHeartbeat$(),
-            merge(this.workflow$(), this.activity$()).pipe(
+            merge(this.workflow$(), this.activity$(), this.nexus$()).pipe(
               tap({
                 complete: () => {
                   this.state = 'DRAINED';
@@ -1824,11 +2126,11 @@ export class Worker {
       unexpectedErrorSubscription.unsubscribe();
       try {
         // Only exists in non-replay Worker
-        if (this.connection) {
-          extractReferenceHolders(this.connection).delete(this.nativeWorker);
+        if (this._connection) {
+          extractReferenceHolders(this._connection).delete(this.nativeWorker);
           // Only close if this worker is the creator of the connection
-          if (this.connection instanceof InternalNativeConnection) {
-            await this.connection.close();
+          if (this._connection instanceof InternalNativeConnection) {
+            await this._connection.close();
           }
         }
         await this.workflowCreator?.destroy();
@@ -1877,7 +2179,7 @@ export function parseWorkflowCode(code: string, codePath?: string): WorkflowBund
   return { code, sourceMap, filename };
 }
 
-function extractSourceMap(code: string) {
+function extractSourceMap(code: string): [string, string] {
   const sourceMapCommentPos = code.lastIndexOf('//# sourceMappingURL=data:');
   if (sourceMapCommentPos > 0) {
     const base64TagIndex = code.indexOf('base64,', sourceMapCommentPos);
@@ -1934,6 +2236,7 @@ async function extractActivityInfo(
       'currentAttemptScheduledTime'
     ),
     priority: decodePriority(start.priority),
+    retryPolicy: decompileRetryPolicy(start.retryPolicy),
   };
 }
 

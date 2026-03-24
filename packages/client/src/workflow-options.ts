@@ -50,10 +50,14 @@ export interface WorkflowOptions extends CommonWorkflowOptions {
 
   /**
    * Override the versioning behavior of the Workflow that is about to be started.
-   *
-   * @experimental Deployment based versioning is experimental and may change in the future.
    */
   versioningOverride?: VersioningOverride;
+
+  /**
+   * Potentially reduce the latency to start this workflow by requesting that the server
+   * start it on a local worker running with this same client.
+   */
+  requestEagerStart?: boolean;
 }
 
 export type WithCompiledWorkflowOptions<T extends WorkflowOptions> = Replace<
@@ -97,7 +101,8 @@ export type WorkflowSignalWithStartOptions<SignalArgs extends any[] = []> = Sign
   ? WorkflowSignalWithStartOptionsWithArgs<SignalArgs>
   : WorkflowSignalWithStartOptionsWithoutArgs<SignalArgs>;
 
-export interface WorkflowSignalWithStartOptionsWithoutArgs<SignalArgs extends any[]> extends WorkflowOptions {
+export interface WorkflowSignalWithStartOptionsWithoutArgs<SignalArgs extends any[]>
+  extends Omit<WorkflowOptions, 'requestEagerStart'> {
   /**
    * SignalDefinition or name of signal
    */
@@ -109,7 +114,8 @@ export interface WorkflowSignalWithStartOptionsWithoutArgs<SignalArgs extends an
   signalArgs?: SignalArgs;
 }
 
-export interface WorkflowSignalWithStartOptionsWithArgs<SignalArgs extends any[]> extends WorkflowOptions {
+export interface WorkflowSignalWithStartOptionsWithArgs<SignalArgs extends any[]>
+  extends Omit<WorkflowOptions, 'requestEagerStart'> {
   /**
    * SignalDefinition or name of signal
    */

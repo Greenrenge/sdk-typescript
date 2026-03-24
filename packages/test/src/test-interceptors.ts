@@ -12,12 +12,16 @@ import { WorkflowClient, WorkflowFailedError } from '@temporalio/client';
 import { ApplicationFailure, TerminatedFailure } from '@temporalio/common';
 import { DefaultLogger, Runtime } from '@temporalio/worker';
 import { defaultPayloadConverter, WorkflowInfo } from '@temporalio/workflow';
-import { cleanOptionalStackTrace, RUN_INTEGRATION_TESTS, Worker } from './helpers';
+import { isBun, cleanOptionalStackTrace, compareStackTrace, RUN_INTEGRATION_TESTS, Worker } from './helpers';
 import { defaultOptions } from './mock-native-worker';
 import {
+  checkDisposeRan,
+  conditionWithTimeoutAfterDisposal,
   continueAsNewToDifferentWorkflow,
+  initAndResetFlag,
   interceptorExample,
   internalsInterceptorExample,
+  successString,
   unblockOrCancel,
 } from './workflows';
 import { getSecretQuery, unblockWithSecretSignal } from './workflows/interceptor-example';
@@ -241,16 +245,23 @@ if (RUN_INTEGRATION_TESTS) {
       return;
     }
     t.deepEqual(err.cause.message, 'Expected anything other than 1');
-    t.is(
-      cleanOptionalStackTrace(err.cause.stack),
-      dedent`
-      ApplicationFailure: Expected anything other than 1
-          at Function.nonRetryable (common/src/failure.ts)
-          at Object.continueAsNew (test/src/workflows/interceptor-example.ts)
-          at workflow/src/workflow.ts
-          at continueAsNewToDifferentWorkflow (test/src/workflows/continue-as-new-to-different-workflow.ts)
-    `
-    );
+
+    const cleanedStack = cleanOptionalStackTrace(err.cause.stack)!;
+    const expectedStack = isBun
+      ? dedent`
+        ApplicationFailure: Expected anything other than 1
+            at nonRetryable (test/workflow-bundle-$HASH.js)
+            at continueAsNew (test/workflow-bundle-$HASH.js)
+            at continueAsNewToDifferentWorkflow (test/workflow-bundle-$HASH.js)
+      `
+      : dedent`
+        ApplicationFailure: Expected anything other than 1
+            at $CLASS.nonRetryable (common/src/failure.ts)
+            at Object.continueAsNew (test/src/workflows/interceptor-example.ts)
+            at workflow/src/workflow.ts
+            at continueAsNewToDifferentWorkflow (test/src/workflows/continue-as-new-to-different-workflow.ts)
+      `;
+    compareStackTrace(t, cleanedStack, expectedStack);
     t.is(err.cause.cause, undefined);
   });
 
@@ -283,5 +294,67 @@ if (RUN_INTEGRATION_TESTS) {
       })
     );
     t.deepEqual(events, ['activate: 0', 'concludeActivation: 1', 'activate: 0', 'concludeActivation: 1']);
+  });
+
+  test.serial('Internal interceptor disposes in reusable VM', async (t) => {
+    const taskQueue = 'test-reusable-vm-internal-interceptor-disposes';
+    const worker = await Worker.create({
+      ...defaultOptions,
+      taskQueue,
+      interceptors: {
+        workflowModules: [require.resolve('./workflows/internal-interceptor-dispose-global')],
+      },
+    });
+
+    const client = new WorkflowClient();
+    await worker.runUntil(async () => {
+      const disposeFlagSet = await client.execute(initAndResetFlag, {
+        taskQueue,
+        workflowId: uuid4(),
+      });
+      t.false(disposeFlagSet);
+      const disposeFlagSetNow = await client.execute(checkDisposeRan, {
+        taskQueue,
+        workflowId: uuid4(),
+      });
+      t.true(disposeFlagSetNow);
+    });
+  });
+
+  // Test to trigger GH #1866
+  // When `reuseV8Context: true`, dispose() calls disableStorage() which disables the
+  // AsyncLocalStorage instance that stores cancellation scope.
+  // This causes CancellationScope.current() to return rootScope instead of the correct
+  // inner scope for workflows that continue afterward.
+  //
+  // The bug manifests in condition() with timeout: the finally block calls
+  // CancellationScope.current().cancel() to clean up.
+  // When storage is disabled, this incorrectly cancels the rootScope, failing the workflow with "Workflow cancelled".
+  test.serial('workflow disposal does not break CancellationScope in other workflows in reusable vm', async (t) => {
+    const taskQueue = 'test-reusable-vm-disposal-cancellation-scope';
+    const worker = await Worker.create({
+      ...defaultOptions,
+      taskQueue,
+    });
+
+    const client = new WorkflowClient();
+    const result = await worker.runUntil(async () => {
+      // Fill the cache with workflow that complete immediately
+      await client.execute(successString, { taskQueue, workflowId: uuid4() });
+
+      // Start the condition workflow
+      const conditionHandle = await client.start(conditionWithTimeoutAfterDisposal, {
+        taskQueue,
+        workflowId: uuid4(),
+      });
+
+      // Run another workflow to trigger an evictions and disposal() while
+      // conditionWithTimeoutAfterDisposal is cached and waiting
+      await client.execute(successString, { taskQueue, workflowId: uuid4() });
+
+      // If dispose incorrectly disables the cancellation scope storage, then it will fail with CancelledFailure: "Workflow cancelled"
+      return await conditionHandle.result();
+    });
+    t.is(result, 'done');
   });
 }

@@ -8,7 +8,7 @@
  * @module
  */
 
-export { NativeConnection } from './connection';
+export { NativeConnection, NativeConnectionPlugin } from './connection';
 export { NativeConnectionOptions, TLSConfig } from './connection-options';
 export { startDebugReplayer } from './debug-replayer';
 export { IllegalStateError } from '@temporalio/common';
@@ -22,6 +22,7 @@ export {
 export * from './interceptors';
 export { DefaultLogger, LogEntry, LogLevel, LogMetadata, LogTimestamp, Logger } from './logger';
 export { History, Runtime } from './runtime';
+export { MetricsBuffer, MetricsBufferOptions, BufferedMetricUpdate } from './runtime-metrics';
 export {
   RuntimeOptions,
   makeTelemetryFilterString,
@@ -38,13 +39,15 @@ export { DataConverter, defaultPayloadConverter, State, Worker, WorkerStatus } f
 export {
   CompiledWorkerOptions,
   ReplayWorkerOptions,
+  WorkerDeploymentOptions,
   WorkerOptions,
+  WorkerPlugin,
   WorkflowBundle,
   WorkflowBundleOption,
   WorkflowBundlePath,
 } from './worker-options';
 export { ReplayError, ReplayHistoriesIterable, ReplayResult } from './replay';
-export { BundleOptions, bundleWorkflowCode, WorkflowBundleWithSourceMap } from './workflow/bundler';
+export { BundleOptions, bundleWorkflowCode, WorkflowBundleWithSourceMap, BundlerPlugin } from './workflow/bundler';
 export {
   WorkerTuner,
   TunerHolder,
@@ -65,7 +68,6 @@ export {
   SlotReleaseContext,
 } from './worker-tuner';
 
-/* eslint-disable deprecation/deprecation */
 // Anything below this line is deprecated
 
 export {

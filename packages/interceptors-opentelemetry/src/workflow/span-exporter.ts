@@ -1,13 +1,16 @@
 import * as tracing from '@opentelemetry/sdk-trace-base';
 import { ExportResult, ExportResultCode } from '@opentelemetry/core';
-import * as wf from '@temporalio/workflow';
-import { OpenTelemetrySinks, SerializableSpan } from './definitions';
-
-const { exporter } = wf.proxySinks<OpenTelemetrySinks>();
+import { OpenTelemetrySinks, SerializableSpan, SerializableSpanContext } from './definitions';
+import { proxySinks } from './workflow-imports';
 
 export class SpanExporter implements tracing.SpanExporter {
+  private exporter?: OpenTelemetrySinks['exporter'];
+
   public export(spans: tracing.ReadableSpan[], resultCallback: (result: ExportResult) => void): void {
-    exporter.export(spans.map((span) => this.makeSerializable(span)));
+    if (!this.exporter) {
+      this.exporter = proxySinks<OpenTelemetrySinks>().exporter;
+    }
+    this.exporter.export(spans.map((span) => this.makeSerializable(span)));
     resultCallback({ code: ExportResultCode.SUCCESS });
   }
 
@@ -16,10 +19,18 @@ export class SpanExporter implements tracing.SpanExporter {
   }
 
   public makeSerializable(span: tracing.ReadableSpan): SerializableSpan {
+    const { traceState, ...restSpanContext } = span.spanContext();
+    // Serialize traceState to a string because TraceState objects lose their
+    // prototype methods when crossing the V8 isolate boundary.
+    // See: https://github.com/temporalio/sdk-typescript/issues/1738
+    const serializableSpanContext: SerializableSpanContext = {
+      traceState: traceState?.serialize(),
+      ...restSpanContext,
+    };
     return {
       name: span.name,
       kind: span.kind,
-      spanContext: span.spanContext(),
+      spanContext: serializableSpanContext,
       parentSpanId: span.parentSpanContext?.spanId,
       startTime: span.startTime,
       endTime: span.endTime,

@@ -3,6 +3,7 @@ import type { TypedSearchAttributes, SearchAttributes, SearchAttributeValue, Pri
 import { makeProtoEnumConverters } from '@temporalio/common/lib/internal-workflow';
 import * as proto from '@temporalio/proto';
 import { Replace } from '@temporalio/common/lib/type-helpers';
+import type { ConnectionPlugin } from './connection';
 
 export interface WorkflowExecution {
   workflowId: string;
@@ -28,6 +29,7 @@ export type WorkflowExecutionStatusName =
   | 'TERMINATED'
   | 'CONTINUED_AS_NEW'
   | 'TIMED_OUT'
+  | 'PAUSED'
   | 'UNKNOWN'; // UNKNOWN is reserved for future enum values
 
 export interface WorkflowExecutionInfo {
@@ -48,7 +50,7 @@ export interface WorkflowExecutionInfo {
   closeTime?: Date;
   memo?: Record<string, unknown>;
   /** @deprecated Use {@link typedSearchAttributes} instead. */
-  searchAttributes: SearchAttributes; // eslint-disable-line deprecation/deprecation
+  searchAttributes: SearchAttributes; // eslint-disable-line @typescript-eslint/no-deprecated
   typedSearchAttributes: TypedSearchAttributes;
   parentExecution?: Required<proto.temporal.api.common.v1.IWorkflowExecution>;
   rootExecution?: Required<proto.temporal.api.common.v1.IWorkflowExecution>;
@@ -60,7 +62,7 @@ export interface CountWorkflowExecution {
   count: number;
   groups: {
     count: number;
-    groupValues: SearchAttributeValue[]; // eslint-disable-line deprecation/deprecation
+    groupValues: SearchAttributeValue[]; // eslint-disable-line @typescript-eslint/no-deprecated
   }[];
 }
 
@@ -69,12 +71,30 @@ export type WorkflowExecutionDescription = Replace<
   {
     raw: DescribeWorkflowExecutionResponse;
   }
->;
+> & {
+  /**
+   * General fixed details for this workflow execution that may appear in UI/CLI.
+   * This can be in Temporal markdown format and can span multiple lines.
+   *
+   * @experimental User metadata is a new API and susceptible to change.
+   */
+  staticDetails: () => Promise<string | undefined>;
+
+  /**
+   * A single-line fixed summary for this workflow execution that may appear in the UI/CLI.
+   * This can be in single-line Temporal markdown format.
+   *
+   * @experimental User metadata is a new API and susceptible to change.
+   */
+  staticSummary: () => Promise<string | undefined>;
+};
 
 export type WorkflowService = proto.temporal.api.workflowservice.v1.WorkflowService;
 export const { WorkflowService } = proto.temporal.api.workflowservice.v1;
 export type OperatorService = proto.temporal.api.operatorservice.v1.OperatorService;
 export const { OperatorService } = proto.temporal.api.operatorservice.v1;
+export type TestService = proto.temporal.api.testservice.v1.TestService;
+export const { TestService } = proto.temporal.api.testservice.v1;
 export type HealthService = proto.grpc.health.v1.Health;
 export const { Health: HealthService } = proto.grpc.health.v1;
 
@@ -101,12 +121,11 @@ export interface CallContext {
 
 /**
  * Connection interface used by high level SDK clients.
- *
- * NOTE: Currently the SDK only supports grpc-js based connection but in the future
- * we might support grpc-web and native Rust connections.
  */
 export interface ConnectionLike {
   workflowService: WorkflowService;
+  operatorService: OperatorService;
+  plugins: ConnectionPlugin[];
   close(): Promise<void>;
   ensureConnected(): Promise<void>;
 
@@ -149,22 +168,33 @@ export interface ConnectionLike {
   withAbortSignal<R>(abortSignal: AbortSignal, fn: () => Promise<R>): Promise<R>;
 }
 
+export const InternalConnectionLikeSymbol = Symbol('__temporal_internal_connection_like');
+export type InternalConnectionLike = ConnectionLike & {
+  [InternalConnectionLikeSymbol]?: {
+    /**
+     * Capability flag that determines whether the connection supports eager workflow start.
+     * This will only be true if the underlying connection is a {@link NativeConnection}.
+     */
+    readonly supportsEagerStart?: boolean;
+  };
+};
+
 export const QueryRejectCondition = {
   NONE: 'NONE',
   NOT_OPEN: 'NOT_OPEN',
   NOT_COMPLETED_CLEANLY: 'NOT_COMPLETED_CLEANLY',
 
   /** @deprecated Use {@link NONE} instead. */
-  QUERY_REJECT_CONDITION_NONE: 'NONE', // eslint-disable-line deprecation/deprecation
+  QUERY_REJECT_CONDITION_NONE: 'NONE',
 
   /** @deprecated Use {@link NOT_OPEN} instead. */
-  QUERY_REJECT_CONDITION_NOT_OPEN: 'NOT_OPEN', // eslint-disable-line deprecation/deprecation
+  QUERY_REJECT_CONDITION_NOT_OPEN: 'NOT_OPEN',
 
   /** @deprecated Use {@link NOT_COMPLETED_CLEANLY} instead. */
-  QUERY_REJECT_CONDITION_NOT_COMPLETED_CLEANLY: 'NOT_COMPLETED_CLEANLY', // eslint-disable-line deprecation/deprecation
+  QUERY_REJECT_CONDITION_NOT_COMPLETED_CLEANLY: 'NOT_COMPLETED_CLEANLY',
 
   /** @deprecated Use `undefined` instead. */
-  QUERY_REJECT_CONDITION_UNSPECIFIED: undefined, // eslint-disable-line deprecation/deprecation
+  QUERY_REJECT_CONDITION_UNSPECIFIED: undefined,
 } as const;
 export type QueryRejectCondition = (typeof QueryRejectCondition)[keyof typeof QueryRejectCondition];
 

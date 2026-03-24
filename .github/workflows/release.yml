@@ -6,6 +6,10 @@ on:
       - main
       - 'releases/*'
 
+permissions:
+  contents: read
+  actions: write
+
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   # Is it the official main branch, or an official release branches?
@@ -37,7 +41,7 @@ jobs:
             out-file: libtemporal_sdk_typescript_bridge.so
             protobuf-url: https://github.com/protocolbuffers/protobuf/releases/download/v22.3/protoc-22.3-linux-aarch_64.zip
           - platform: macos-x64
-            runner: macos-13
+            runner: macos-15-intel
             target: x86_64-apple-darwin
             out-file: libtemporal_sdk_typescript_bridge.dylib
           - platform: macos-arm
@@ -165,33 +169,19 @@ jobs:
           mv tmp/corebridge-*/* ./
           rm -rf tmp
 
-      - name: Install Node
-        uses: actions/setup-node@v4
+      - name: Setup Node and Install Dependencies
+        id: setup-node
+        uses: ./.github/actions/setup-node-deps
         with:
-          node-version: 20
-
-      - name: Get NPM cache directory
-        id: npm-cache-dir
-        run: echo "dir=$(npm config get cache)" >> ${GITHUB_OUTPUT}
-
-      - name: Restore NPM cache
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ steps.npm-cache-dir.outputs.dir }}
-          key: npm-main-${{ matrix.platform }}-${{ hashFiles('./package-lock.json') }}
-          restore-keys: |
-            npm-main-${{ matrix.platform }}-
-
-      - name: Download dependencies
-        # Make up to 3 attempts to install NPM dependencies, to work around transient NPM errors :(
-        run: |
-          npm ci --ignore-scripts --verbose || npm ci --ignore-scripts --verbose || npm ci --ignore-scripts --verbose
+          node-version: '22'
+          platform: ${{ matrix.platform }}
+          save-cache: ${{ env.IS_MAIN_OR_RELEASE }}
 
       - name: Compile code
-        run: npm run build -- --ignore @temporalio/core-bridge
+        run: pnpm --recursive --stream --filter '!@temporalio/core-bridge' --filter '!typescript-sdk' run build
 
       - name: Publish to Verdaccio
-        run: node scripts/publish-to-verdaccio.js --registry-dir ./tmp/registry
+        run: pnpm tsx scripts/publish-to-verdaccio.ts --registry-dir ./tmp/registry
 
       - name: Save Verdaccio repo artifact
         uses: actions/upload-artifact@v4
@@ -199,21 +189,13 @@ jobs:
           name: verdaccio-repo
           path: ./tmp/registry/storage
 
-      - name: Save NPM cache
-        uses: actions/cache/save@v4
-        # Only saves NPM cache from the main branch, to reduce pressure on the cache (limited to 10GB).
-        if: ${{ env.IS_MAIN_OR_RELEASE == 'true' }}
-        with:
-          path: ${{ steps.npm-cache-dir.outputs.dir }}
-          key: npm-main-${{ matrix.platform }}-${{ hashFiles('./package-lock.json') }}
-
   # Tests that npm init @temporalio results in a working worker and client
   test-npm-init:
     needs: build-packages
     strategy:
       fail-fast: false
       matrix:
-        node: [18, 22] # Min and max supported Node versions
+        node: [20, 22, 24] # Min and max officially supported Node versions + next max
         platform: [linux-x64, linux-arm, macos-x64, macos-arm, windows-x64]
         sample: [hello-world, fetch-esm, hello-world-mtls]
         server: [cli, cloud]
@@ -237,7 +219,7 @@ jobs:
           - platform: linux-arm
             runner: ubuntu-24.04-arm64-2-core
           - platform: macos-x64
-            runner: macos-13
+            runner: macos-15-intel
           - platform: macos-arm
             runner: macos-14
           - platform: windows-x64
@@ -254,28 +236,11 @@ jobs:
           # We don't need the core submodule here since won't build the project
           submodules: false
 
-      - name: Install Node
-        uses: actions/setup-node@v4
+      - name: Setup Node and Install Dependencies
+        uses: ./.github/actions/setup-node-deps
         with:
           node-version: ${{ matrix.node }}
-
-      - name: Get NPM cache directory
-        id: npm-cache-dir
-        shell: bash
-        run: echo "dir=$(npm config get cache)" >> ${GITHUB_OUTPUT}
-
-      - name: Restore NPM cache
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ steps.npm-cache-dir.outputs.dir }}
-          key: npm-main-${{ matrix.platform }}-${{ hashFiles('./package-lock.json') }}
-          restore-keys: |
-            npm-main-${{ matrix.platform }}-
-
-      # No need to compile anything, we just need the package ./scripts and their dependencies
-      - name: Install dependencies without compilation
-        run: |
-          npm ci --ignore-scripts --verbose || npm ci --ignore-scripts --verbose || npm ci --ignore-scripts --verbose
+          platform: ${{ matrix.platform }}
 
       - name: Restore Verdaccio repo artifact
         uses: actions/download-artifact@v4
@@ -285,7 +250,7 @@ jobs:
 
       # Note: here, `npx create` fails on windows if shell is bash.
       - name: Instantiate sample project using verdaccio artifacts
-        run: node scripts/init-from-verdaccio.js --registry-dir ./tmp/registry --sample ${{ matrix.sample }} --target-dir ${{ runner.temp }}/example
+        run: pnpm tsx scripts/init-from-verdaccio.ts --registry-dir ./tmp/registry --sample ${{ matrix.sample }} --target-dir ${{ runner.temp }}/example
 
       - name: Install Temporal CLI
         if: matrix.server == 'cli'
@@ -304,7 +269,7 @@ jobs:
         # We write the certs to disk because it serves the sample. Written into /tmp/temporal-certs
       - name: Create certs dir
         shell: bash
-        run: node scripts/create-certs-dir.js "${{ runner.temp }}/certs"
+        run: pnpm tsx scripts/create-certs-dir.ts "${{ runner.temp }}/certs"
         if: matrix.server == 'cloud'
         env:
           # These env vars are used by the hello-world-mtls sample
@@ -314,16 +279,14 @@ jobs:
           TEMPORAL_CLIENT_KEY: ${{ secrets.TEMPORAL_CLIENT_KEY }}
 
       - name: Test run a workflow (non-cloud)
-        run: node scripts/test-example.js --work-dir "${{ runner.temp }}/example"
+        run: pnpm tsx scripts/test-example.ts --work-dir "${{ runner.temp }}/example"
         shell: bash
         if: matrix.server == 'cli'
 
       - name: Test run a workflow (cloud)
         if: matrix.server == 'cloud'
-        run: |
-          # The required environment variables must be present for releases (this must be run from the official repo)
-          node scripts/create-certs-dir.js ${{ steps.tmp-dir.outputs.dir }}/certs
-          node scripts/test-example.js --work-dir "${{ runner.temp }}/example"
+        # The required environment variables must be present for releases (this must be run from the official repo)
+        run: pnpm tsx scripts/test-example.ts --work-dir "${{ runner.temp }}/example"
         shell: bash
         env:
           # These env vars are used by the hello-world-mtls sample
@@ -351,3 +314,5 @@ jobs:
     secrets:
       ALGOLIA_API_KEY: ${{ secrets.ALGOLIA_API_KEY }}
       VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}

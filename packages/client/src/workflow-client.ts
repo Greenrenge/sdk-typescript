@@ -24,6 +24,7 @@ import {
   WorkflowIdConflictPolicy,
   compilePriority,
 } from '@temporalio/common';
+import { encodeUserMetadata } from '@temporalio/common/lib/internal-non-workflow/codec-helpers';
 import { encodeUnifiedSearchAttributes } from '@temporalio/common/lib/converter/payload-search-attributes';
 import { composeInterceptors } from '@temporalio/common/lib/interceptors';
 import { History } from '@temporalio/common/lib/proto-utils';
@@ -32,6 +33,7 @@ import {
   decodeArrayFromPayloads,
   decodeFromPayloadsAtIndex,
   decodeOptionalFailureToOptionalError,
+  decodeOptionalSinglePayload,
   encodeMapToPayloads,
   encodeToPayloads,
 } from '@temporalio/common/lib/internal-non-workflow';
@@ -59,12 +61,15 @@ import {
   WorkflowStartUpdateOutput,
   WorkflowStartUpdateWithStartInput,
   WorkflowStartUpdateWithStartOutput,
+  WorkflowStartOutput,
 } from './interceptors';
 import {
   CountWorkflowExecution,
   DescribeWorkflowExecutionResponse,
   encodeQueryRejectCondition,
   GetWorkflowExecutionHistoryRequest,
+  InternalConnectionLike,
+  InternalConnectionLikeSymbol,
   QueryRejectCondition,
   RequestCancelWorkflowExecutionResponse,
   StartWorkflowExecutionRequest,
@@ -91,6 +96,8 @@ import {
 } from './base-client';
 import { mapAsyncIterable } from './iterators-utils';
 import { WorkflowUpdateStage, encodeWorkflowUpdateStage } from './workflow-update-stage';
+import { InternalWorkflowStartOptionsSymbol, InternalWorkflowStartOptions } from './internal';
+import { adaptWorkflowClientInterceptor } from './interceptor-adapters';
 
 const UpdateWorkflowExecutionLifecycleStage = temporal.api.enums.v1.UpdateWorkflowExecutionLifecycleStage;
 
@@ -261,6 +268,15 @@ export interface WorkflowHandleWithFirstExecutionRunId<T extends Workflow = Work
 }
 
 /**
+ * This interface is exactly the same as {@link WorkflowHandleWithFirstExecutionRunId} except it
+ * includes the `eagerlyStarted` returned from {@link WorkflowClient.start}.
+ */
+export interface WorkflowHandleWithStartDetails<T extends Workflow = Workflow>
+  extends WorkflowHandleWithFirstExecutionRunId<T> {
+  readonly eagerlyStarted: boolean;
+}
+
+/**
  * This interface is exactly the same as {@link WorkflowHandle} except it
  * includes the `signaledRunId` returned from `signalWithStart`.
  */
@@ -280,7 +296,7 @@ export interface WorkflowClientOptions extends BaseClientOptions {
    *
    * Useful for injecting auth headers and tracing Workflow executions
    */
-  // eslint-disable-next-line deprecation/deprecation
+  // eslint-disable-next-line @typescript-eslint/no-deprecated
   interceptors?: WorkflowClientInterceptors | WorkflowClientInterceptor[];
 
   /**
@@ -509,16 +525,21 @@ export class WorkflowClient extends BaseClient {
 
   protected async _start<T extends Workflow>(
     workflowTypeOrFunc: string | T,
-    options: WithWorkflowArgs<T, WorkflowOptions>,
+    options: WorkflowStartOptions<T>,
     interceptors: WorkflowClientInterceptor[]
-  ): Promise<string> {
+  ): Promise<WorkflowStartOutput> {
     const workflowType = extractWorkflowType(workflowTypeOrFunc);
     assertRequiredWorkflowOptions(options);
     const compiledOptions = compileWorkflowOptions(ensureArgs(options));
+    const adaptedInterceptors = interceptors.map((i) => adaptWorkflowClientInterceptor(i));
 
-    const start = composeInterceptors(interceptors, 'start', this._startWorkflowHandler.bind(this));
+    const startWithDetails = composeInterceptors(
+      adaptedInterceptors,
+      'startWithDetails',
+      this._startWorkflowHandler.bind(this)
+    );
 
-    return start({
+    return startWithDetails({
       options: compiledOptions,
       headers: {},
       workflowType,
@@ -534,7 +555,6 @@ export class WorkflowClient extends BaseClient {
     const { signal, signalArgs, ...rest } = options;
     assertRequiredWorkflowOptions(rest);
     const compiledOptions = compileWorkflowOptions(ensureArgs(rest));
-
     const signalWithStart = composeInterceptors(
       interceptors,
       'signalWithStart',
@@ -558,22 +578,25 @@ export class WorkflowClient extends BaseClient {
   public async start<T extends Workflow>(
     workflowTypeOrFunc: string | T,
     options: WorkflowStartOptions<T>
-  ): Promise<WorkflowHandleWithFirstExecutionRunId<T>> {
+  ): Promise<WorkflowHandleWithStartDetails<T>> {
     const { workflowId } = options;
     const interceptors = this.getOrMakeInterceptors(workflowId);
-    const runId = await this._start(workflowTypeOrFunc, { ...options, workflowId }, interceptors);
+    const wfStartOutput = await this._start(workflowTypeOrFunc, { ...options, workflowId }, interceptors);
     // runId is not used in handles created with `start*` calls because these
     // handles should allow interacting with the workflow if it continues as new.
-    const handle = this._createWorkflowHandle({
+    const baseHandle = this._createWorkflowHandle({
       workflowId,
       runId: undefined,
-      firstExecutionRunId: runId,
-      runIdForResult: runId,
+      firstExecutionRunId: wfStartOutput.runId,
+      runIdForResult: wfStartOutput.runId,
       interceptors,
       followRuns: options.followRuns ?? true,
-    }) as WorkflowHandleWithFirstExecutionRunId<T>; // Cast is safe because we know we add the firstExecutionRunId below
-    (handle as any) /* readonly */.firstExecutionRunId = runId;
-    return handle;
+    });
+    return {
+      ...baseHandle,
+      firstExecutionRunId: wfStartOutput.runId,
+      eagerlyStarted: wfStartOutput.eagerlyStarted,
+    };
   }
 
   /**
@@ -793,7 +816,8 @@ export class WorkflowClient extends BaseClient {
       if (events.length !== 1) {
         throw new Error(`Expected at most 1 close event(s), got: ${events.length}`);
       }
-      ev = events[0];
+      // getWorkflowExecutionHistory should never return an array of undefined events
+      ev = events[0]!;
 
       if (ev.workflowExecutionCompletedEventAttributes) {
         if (followRuns && ev.workflowExecutionCompletedEventAttributes.newExecutionRunId) {
@@ -1009,7 +1033,7 @@ export class WorkflowClient extends BaseClient {
     }
     return {
       updateId: request.request!.meta!.updateId!,
-      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+
       workflowRunId: response.updateRef!.workflowExecution!.runId!,
       outcome: response.outcome ?? undefined,
     };
@@ -1213,13 +1237,14 @@ export class WorkflowClient extends BaseClient {
       retryPolicy: options.retry ? compileRetryPolicy(options.retry) : undefined,
       memo: options.memo ? { fields: await encodeMapToPayloads(this.dataConverter, options.memo) } : undefined,
       searchAttributes:
-        options.searchAttributes || options.typedSearchAttributes // eslint-disable-line deprecation/deprecation
+        options.searchAttributes || options.typedSearchAttributes // eslint-disable-line @typescript-eslint/no-deprecated
           ? {
-              indexedFields: encodeUnifiedSearchAttributes(options.searchAttributes, options.typedSearchAttributes), // eslint-disable-line deprecation/deprecation
+              indexedFields: encodeUnifiedSearchAttributes(options.searchAttributes, options.typedSearchAttributes), // eslint-disable-line @typescript-eslint/no-deprecated
             }
           : undefined,
       cronSchedule: options.cronSchedule,
       header: { fields: headers },
+      userMetadata: await encodeUserMetadata(this.dataConverter, options.staticSummary, options.staticDetails),
       priority: options.priority ? compilePriority(options.priority) : undefined,
       versioningOverride: options.versioningOverride ?? undefined,
     };
@@ -1242,11 +1267,19 @@ export class WorkflowClient extends BaseClient {
    *
    * Used as the final function of the start interceptor chain
    */
-  protected async _startWorkflowHandler(input: WorkflowStartInput): Promise<string> {
+  protected async _startWorkflowHandler(input: WorkflowStartInput): Promise<WorkflowStartOutput> {
     const req = await this.createStartWorkflowRequest(input);
     const { options: opts, workflowType } = input;
+    const internalOptions = (opts as InternalWorkflowStartOptions)[InternalWorkflowStartOptionsSymbol];
     try {
-      return (await this.workflowService.startWorkflowExecution(req)).runId;
+      const response = await this.workflowService.startWorkflowExecution(req);
+      if (internalOptions != null) {
+        internalOptions.backLink = response.link ?? undefined;
+      }
+      return {
+        runId: response.runId,
+        eagerlyStarted: response.eagerWorkflowTask != null,
+      };
     } catch (err: any) {
       if (err.code === grpcStatus.ALREADY_EXISTS) {
         throw new WorkflowExecutionAlreadyStartedError(
@@ -1262,11 +1295,21 @@ export class WorkflowClient extends BaseClient {
   protected async createStartWorkflowRequest(input: WorkflowStartInput): Promise<StartWorkflowExecutionRequest> {
     const { options: opts, workflowType, headers } = input;
     const { identity, namespace } = this.options;
+    const internalOptions = (opts as InternalWorkflowStartOptions)[InternalWorkflowStartOptionsSymbol];
+    const supportsEagerStart = (this.connection as InternalConnectionLike)?.[InternalConnectionLikeSymbol]
+      ?.supportsEagerStart;
+
+    if (opts.requestEagerStart && !supportsEagerStart) {
+      throw new Error(
+        'Eager workflow start requires a NativeConnection shared between client and worker. ' +
+          'Pass a NativeConnection via ClientOptions.connection, or disable requestEagerStart.'
+      );
+    }
 
     return {
       namespace,
       identity,
-      requestId: uuid4(),
+      requestId: internalOptions?.requestId ?? uuid4(),
       workflowId: opts.workflowId,
       workflowIdReusePolicy: encodeWorkflowIdReusePolicy(opts.workflowIdReusePolicy),
       workflowIdConflictPolicy: encodeWorkflowIdConflictPolicy(opts.workflowIdConflictPolicy),
@@ -1283,15 +1326,18 @@ export class WorkflowClient extends BaseClient {
       retryPolicy: opts.retry ? compileRetryPolicy(opts.retry) : undefined,
       memo: opts.memo ? { fields: await encodeMapToPayloads(this.dataConverter, opts.memo) } : undefined,
       searchAttributes:
-        opts.searchAttributes || opts.typedSearchAttributes // eslint-disable-line deprecation/deprecation
+        opts.searchAttributes || opts.typedSearchAttributes // eslint-disable-line @typescript-eslint/no-deprecated
           ? {
-              indexedFields: encodeUnifiedSearchAttributes(opts.searchAttributes, opts.typedSearchAttributes), // eslint-disable-line deprecation/deprecation
+              indexedFields: encodeUnifiedSearchAttributes(opts.searchAttributes, opts.typedSearchAttributes), // eslint-disable-line @typescript-eslint/no-deprecated
             }
           : undefined,
       cronSchedule: opts.cronSchedule,
       header: { fields: headers },
+      userMetadata: await encodeUserMetadata(this.dataConverter, opts.staticSummary, opts.staticDetails),
       priority: opts.priority ? compilePriority(opts.priority) : undefined,
       versioningOverride: opts.versioningOverride ?? undefined,
+      requestEagerExecution: opts.requestEagerStart,
+      ...filterNullAndUndefined(internalOptions ?? {}),
     };
   }
 
@@ -1425,8 +1471,13 @@ export class WorkflowClient extends BaseClient {
           workflowExecution: { workflowId, runId },
         });
         const info = await executionInfoFromRaw(raw.workflowExecutionInfo ?? {}, this.client.dataConverter, raw);
+        const userMetadata = raw.executionConfig?.userMetadata;
         return {
           ...info,
+          staticDetails: async () =>
+            (await decodeOptionalSinglePayload(this.client.dataConverter, userMetadata?.details)) ?? undefined,
+          staticSummary: async () =>
+            (await decodeOptionalSinglePayload(this.client.dataConverter, userMetadata?.summary)) ?? undefined,
           raw,
         };
       },
@@ -1598,7 +1649,7 @@ export class WorkflowClient extends BaseClient {
 
   protected getOrMakeInterceptors(workflowId: string, runId?: string): WorkflowClientInterceptor[] {
     if (typeof this.options.interceptors === 'object' && 'calls' in this.options.interceptors) {
-      // eslint-disable-next-line deprecation/deprecation
+      // eslint-disable-next-line @typescript-eslint/no-deprecated
       const factories = (this.options.interceptors as WorkflowClientInterceptors).calls ?? [];
       return factories.map((ctor) => ctor({ workflowId, runId }));
     }

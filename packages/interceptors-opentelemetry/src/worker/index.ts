@@ -1,17 +1,30 @@
 import * as otel from '@opentelemetry/api';
-import { Resource } from '@opentelemetry/resources';
-import { ReadableSpan, SpanExporter } from '@opentelemetry/sdk-trace-base';
-import { Context as ActivityContext } from '@temporalio/activity';
-import {
-  ActivityExecuteInput,
+import { createTraceState } from '@opentelemetry/api';
+import type { Resource } from '@opentelemetry/resources';
+import type { ReadableSpan, SpanExporter, SpanProcessor } from '@opentelemetry/sdk-trace-base';
+import type { Context as ActivityContext } from '@temporalio/activity';
+import type {
+  Next,
   ActivityInboundCallsInterceptor,
   ActivityOutboundCallsInterceptor,
-  GetLogAttributesInput,
   InjectedSink,
-  Next,
+  GetLogAttributesInput,
+  GetMetricTagsInput,
+  ActivityExecuteInput,
 } from '@temporalio/worker';
-import { instrument, extractContextFromHeaders } from '../instrumentation';
-import { OpenTelemetryWorkflowExporter, SerializableSpan, SpanName, SPAN_DELIMITER } from '../workflow';
+import {
+  instrument,
+  extractContextFromHeaders,
+  WORKFLOW_ID_ATTR_KEY,
+  RUN_ID_ATTR_KEY,
+  ACTIVITY_ID_ATTR_KEY,
+} from '../instrumentation';
+import {
+  type OpenTelemetryWorkflowExporter,
+  type SerializableSpan,
+  SpanName,
+  SPAN_DELIMITER,
+} from '../workflow/definitions';
 
 export interface InterceptorOptions {
   readonly tracer?: otel.Tracer;
@@ -34,16 +47,26 @@ export class OpenTelemetryActivityInboundInterceptor implements ActivityInboundC
   }
 
   async execute(input: ActivityExecuteInput, next: Next<ActivityInboundCallsInterceptor, 'execute'>): Promise<unknown> {
-    const context = await extractContextFromHeaders(input.headers);
+    const context = extractContextFromHeaders(input.headers);
     const spanName = `${SpanName.ACTIVITY_EXECUTE}${SPAN_DELIMITER}${this.ctx.info.activityType}`;
-    return await instrument({ tracer: this.tracer, spanName, fn: () => next(input), context });
+    return await instrument({
+      tracer: this.tracer,
+      spanName,
+      fn: (span) => {
+        span.setAttribute(WORKFLOW_ID_ATTR_KEY, this.ctx.info.workflowExecution.workflowId);
+        span.setAttribute(RUN_ID_ATTR_KEY, this.ctx.info.workflowExecution.runId);
+        span.setAttribute(ACTIVITY_ID_ATTR_KEY, this.ctx.info.activityId);
+        return next(input);
+      },
+      context,
+    });
   }
 }
 
 /**
- * Intercepts calls to emit logs from an Activity.
+ * Intercepts calls to emit logs and metrics from an Activity.
  *
- * Attach OpenTelemetry context tracing attributes to emitted log messages, if appropriate.
+ * Attach OpenTelemetry context tracing attributes to emitted log messages and metrics, if appropriate.
  */
 export class OpenTelemetryActivityOutboundInterceptor implements ActivityOutboundCallsInterceptor {
   constructor(protected readonly ctx: ActivityContext) {}
@@ -65,15 +88,50 @@ export class OpenTelemetryActivityOutboundInterceptor implements ActivityOutboun
       return next(input);
     }
   }
+
+  public getMetricTags(
+    input: GetMetricTagsInput,
+    next: Next<ActivityOutboundCallsInterceptor, 'getMetricTags'>
+  ): GetMetricTagsInput {
+    const span = otel.trace.getSpan(otel.context.active());
+    const spanContext = span?.spanContext();
+    if (spanContext && otel.isSpanContextValid(spanContext)) {
+      return next({
+        trace_id: spanContext.traceId,
+        span_id: spanContext.spanId,
+        trace_flags: `0${spanContext.traceFlags.toString(16)}`,
+        ...input,
+      });
+    } else {
+      return next(input);
+    }
+  }
 }
 
 /**
  * Takes an opentelemetry SpanExporter and turns it into an injected Workflow span exporter sink
+ *
+ * @deprecated Do not directly pass a `SpanExporter`. Pass a `SpanProcessor` instead to ensure proper handling of async attributes.
  */
 export function makeWorkflowExporter(
-  exporter: SpanExporter,
+  spanExporter: SpanExporter,
+  resource: Resource
+): InjectedSink<OpenTelemetryWorkflowExporter>;
+/**
+ * Takes an opentelemetry SpanProcessor and turns it into an injected Workflow span exporter sink.
+ *
+ * For backward compatibility, passing a `SpanExporter` directly is still supported.
+ */
+export function makeWorkflowExporter(
+  spanProcessor: SpanProcessor,
+  resource: Resource
+): InjectedSink<OpenTelemetryWorkflowExporter>;
+export function makeWorkflowExporter(
+  processorOrExporter: SpanProcessor | SpanExporter,
   resource: Resource
 ): InjectedSink<OpenTelemetryWorkflowExporter> {
+  const givenSpanProcessor = isSpanProcessor(processorOrExporter);
+
   return {
     export: {
       fn: (info, spanData) => {
@@ -82,23 +140,49 @@ export function makeWorkflowExporter(
           // Spans are copied over from the isolate and are converted to ReadableSpan instances
           return extractReadableSpan(serialized, resource);
         });
-        // Ignore the export result for simplicity
-        exporter.export(spans, () => undefined);
+
+        if (givenSpanProcessor) {
+          spans.forEach((span) => processorOrExporter.onEnd(span));
+        } else {
+          // Ignore the export result for simplicity
+          processorOrExporter.export(spans, () => undefined);
+        }
       },
     },
   };
+}
+
+function isSpanProcessor(obj: SpanProcessor | SpanExporter): obj is SpanProcessor {
+  return 'onEnd' in obj && typeof obj.onEnd === 'function';
 }
 
 /**
  * Deserialize a serialized span created by the Workflow isolate
  */
 function extractReadableSpan(serializable: SerializableSpan, resource: Resource): ReadableSpan {
-  const { spanContext, ...rest } = serializable;
+  const {
+    spanContext: { traceState, ...restSpanContext },
+    parentSpanId,
+    ...rest
+  } = serializable;
+  const spanContext: otel.SpanContext = {
+    // Reconstruct the TraceState from the serialized string.
+    traceState: traceState ? createTraceState(traceState) : undefined,
+    ...restSpanContext,
+  };
+  const parentSpanContext: otel.SpanContext | undefined = parentSpanId
+    ? {
+        traceId: spanContext.traceId,
+        spanId: parentSpanId,
+        traceFlags: otel.TraceFlags.SAMPLED,
+      }
+    : undefined;
   return {
     spanContext() {
       return spanContext;
     },
     resource,
+    parentSpanContext,
     ...rest,
   };
 }

@@ -15,6 +15,7 @@ export {
   type LocalTestWorkflowEnvironmentOptions,
   type TimeSkippingTestWorkflowEnvironmentOptions,
   type ExistingServerTestWorkflowEnvironmentOptions,
+  type NexusEndpointIdentifier,
 } from './testing-workflow-environment';
 
 export {
@@ -23,14 +24,7 @@ export {
   type EphemeralServerExecutable,
 } from './ephemeral-server';
 
-export {
-  // FIXME: Revise the pertinence of these types
-  type ClientOptionsForTestEnv,
-  type TestEnvClientOptions,
-  type TimeSkippingWorkflowClientOptions,
-  TestEnvClient,
-  TimeSkippingWorkflowClient,
-} from './client';
+export { type ClientOptionsForTestEnv, TimeSkippingWorkflowClient } from './client';
 
 export {
   type MockActivityEnvironmentOptions,

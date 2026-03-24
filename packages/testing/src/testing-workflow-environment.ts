@@ -1,13 +1,25 @@
 import 'abort-controller/polyfill'; // eslint-disable-line import/no-unassigned-import
-import { AsyncCompletionClient, Client, WorkflowClient } from '@temporalio/client';
+import {
+  AsyncCompletionClient,
+  Client,
+  ClientPlugin,
+  Connection,
+  ConnectionPlugin,
+  WorkflowClient,
+} from '@temporalio/client';
+import {
+  ConnectionOptions,
+  InternalConnectionOptions,
+  InternalConnectionOptionsSymbol,
+} from '@temporalio/client/lib/connection';
 import { Duration, TypedSearchAttributes } from '@temporalio/common';
 import { msToNumber, msToTs, tsToMs } from '@temporalio/common/lib/time';
-import { NativeConnection, Runtime } from '@temporalio/worker';
+import { NativeConnection, NativeConnectionPlugin, NativeConnectionOptions, Runtime } from '@temporalio/worker';
 import { native } from '@temporalio/core-bridge';
+import { temporal } from '@temporalio/proto';
 import { filterNullAndUndefined } from '@temporalio/common/lib/internal-workflow';
-import { Connection } from './connection';
 import { toNativeEphemeralServerConfig, DevServerConfig, TimeSkippingServerConfig } from './ephemeral-server';
-import { ClientOptionsForTestEnv, TestEnvClient } from './client';
+import { ClientOptionsForTestEnv, TimeSkippingClient } from './client';
 
 /**
  * Options for {@link TestWorkflowEnvironment.createLocal}
@@ -15,6 +27,7 @@ import { ClientOptionsForTestEnv, TestEnvClient } from './client';
 export type LocalTestWorkflowEnvironmentOptions = {
   server?: Omit<DevServerConfig, 'type'>;
   client?: ClientOptionsForTestEnv;
+  plugins?: (ClientPlugin | ConnectionPlugin | NativeConnectionPlugin)[];
 };
 
 /**
@@ -23,6 +36,7 @@ export type LocalTestWorkflowEnvironmentOptions = {
 export type TimeSkippingTestWorkflowEnvironmentOptions = {
   server?: Omit<TimeSkippingServerConfig, 'type'>;
   client?: ClientOptionsForTestEnv;
+  plugins?: (ClientPlugin | ConnectionPlugin | NativeConnectionPlugin)[];
 };
 
 /**
@@ -34,6 +48,7 @@ export type ExistingServerTestWorkflowEnvironmentOptions = {
   /** If not set, defaults to default */
   namespace?: string;
   client?: ClientOptionsForTestEnv;
+  plugins?: (ClientPlugin | ConnectionPlugin | NativeConnectionPlugin)[];
 };
 
 /**
@@ -54,7 +69,7 @@ export class TestWorkflowEnvironment {
   public readonly connection: Connection;
 
   /**
-   * A {@link TestEnvClient} for interacting with the ephemeral server
+   * A {@link TimeSkippingClient} for interacting with the ephemeral server
    */
   public readonly client: Client;
 
@@ -86,19 +101,30 @@ export class TestWorkflowEnvironment {
     protected readonly server: native.EphemeralServer | 'existing',
     connection: Connection,
     nativeConnection: NativeConnection,
-    namespace: string | undefined
+    namespace: string | undefined,
+    /**
+     * Address used when constructing `connection` and `nativeConnection`
+     */
+    public readonly address: string
   ) {
     this.connection = connection;
     this.nativeConnection = nativeConnection;
     this.namespace = namespace;
-    this.client = new TestEnvClient({
-      connection,
-      namespace: this.namespace,
-      enableTimeSkipping: supportsTimeSkipping,
-      ...options.client,
-    });
-    this.asyncCompletionClient = this.client.activity; // eslint-disable-line deprecation/deprecation
-    this.workflowClient = this.client.workflow; // eslint-disable-line deprecation/deprecation
+    this.client = supportsTimeSkipping
+      ? new TimeSkippingClient({
+          connection,
+          namespace: this.namespace,
+          plugins: options.plugins,
+          ...options.client,
+        })
+      : new Client({
+          connection,
+          namespace: this.namespace,
+          plugins: options.plugins,
+          ...options.client,
+        });
+    this.asyncCompletionClient = this.client.activity; // eslint-disable-line @typescript-eslint/no-deprecated
+    this.workflowClient = this.client.workflow; // eslint-disable-line @typescript-eslint/no-deprecated
   }
 
   /**
@@ -135,6 +161,7 @@ export class TestWorkflowEnvironment {
     return await this.create({
       server: { type: 'time-skipping', ...opts?.server },
       client: opts?.client,
+      plugins: opts?.plugins,
       supportsTimeSkipping: true,
     });
   }
@@ -164,6 +191,7 @@ export class TestWorkflowEnvironment {
     return await this.create({
       server: { type: 'dev-server', ...opts?.server },
       client: opts?.client,
+      plugins: opts?.plugins,
       namespace: opts?.server?.namespace,
       supportsTimeSkipping: false,
     });
@@ -179,6 +207,7 @@ export class TestWorkflowEnvironment {
     return await this.create({
       server: { type: 'existing' },
       client: opts?.client,
+      plugins: opts?.plugins,
       namespace: opts?.namespace ?? 'default',
       supportsTimeSkipping: false,
       address: opts?.address,
@@ -220,10 +249,27 @@ export class TestWorkflowEnvironment {
       server = 'existing';
     }
 
-    const nativeConnection = await NativeConnection.connect({ address });
-    const connection = await Connection.connect({ address });
+    const nativeConnection = await NativeConnection.connect(<NativeConnectionOptions & InternalConnectionOptions>{
+      address,
+      plugins: opts.plugins,
+      [InternalConnectionOptionsSymbol]: { supportsTestService: supportsTimeSkipping },
+    });
+    const connection = await Connection.connect(<ConnectionOptions & InternalConnectionOptions>{
+      address,
+      plugins: opts.plugins,
+      [InternalConnectionOptionsSymbol]: { supportsTestService: supportsTimeSkipping },
+    });
 
-    return new this(runtime, optsWithDefaults, supportsTimeSkipping, server, connection, nativeConnection, namespace);
+    return new this(
+      runtime,
+      optsWithDefaults,
+      supportsTimeSkipping,
+      server,
+      connection,
+      nativeConnection,
+      namespace,
+      address
+    );
   }
 
   /**
@@ -292,7 +338,7 @@ export class TestWorkflowEnvironment {
    */
   sleep = async (durationMs: Duration): Promise<void> => {
     if (this.supportsTimeSkipping) {
-      await (this.connection as Connection).testService.unlockTimeSkippingWithSleep({ duration: msToTs(durationMs) });
+      await this.connection.testService!.unlockTimeSkippingWithSleep({ duration: msToTs(durationMs) });
     } else {
       await new Promise((resolve) => setTimeout(resolve, msToNumber(durationMs)));
     }
@@ -306,13 +352,76 @@ export class TestWorkflowEnvironment {
    */
   async currentTimeMs(): Promise<number> {
     if (this.supportsTimeSkipping) {
-      const { time } = await (this.connection as Connection).testService.getCurrentTime({});
+      const { time } = await this.connection.testService!.getCurrentTime({});
       return tsToMs(time);
     } else {
       return Date.now();
     }
   }
+
+  /**
+   * Create a Nexus endpoint targeting a worker task queue.
+   *
+   * This is a convenience method that wraps `connection.operatorService.createNexusEndpoint` for easier
+   * testing of Nexus services.
+   *
+   * @param name - The name of the Nexus endpoint
+   * @param taskQueue - The task queue that will handle Nexus operations
+   * @returns The created Nexus endpoint
+   *
+   * @example
+   * ```ts
+   * const endpoint = await testEnv.createNexusEndpoint('my-endpoint', 'my-task-queue');
+   * const endpointId = endpoint.id;
+   * ```
+   */
+  async createNexusEndpoint(name: string, taskQueue: string): Promise<NexusEndpointIdentifier> {
+    const response = await this.connection.operatorService.createNexusEndpoint({
+      spec: {
+        name,
+        target: {
+          worker: {
+            namespace: this.namespace ?? 'default',
+            taskQueue,
+          },
+        },
+      },
+    });
+    if (!response.endpoint?.id || !response.endpoint?.version) {
+      throw new TypeError('Unexpected response from createNexusEndpoint');
+    }
+    return {
+      id: response.endpoint.id,
+      version: response.endpoint.version,
+      raw: response.endpoint,
+    };
+  }
+
+  /**
+   * Delete a Nexus endpoint.
+   *
+   * This is a convenience method that wraps `connection.operatorService.deleteNexusEndpoint` for easier
+   * testing of Nexus services.
+   *
+   * @param endpoint - The endpoint to delete (can pass the full endpoint object or just an object with id and version)
+   *
+   * @example
+   * ```ts
+   * const endpoint = await testEnv.createNexusEndpoint('my-endpoint', 'my-task-queue');
+   * // ... use the endpoint ...
+   * await testEnv.deleteNexusEndpoint(endpoint);
+   * ```
+   */
+  async deleteNexusEndpoint(endpoint: Pick<NexusEndpointIdentifier, 'id' | 'version'>): Promise<void> {
+    await this.connection.operatorService.deleteNexusEndpoint(endpoint);
+  }
 }
+
+export type NexusEndpointIdentifier = {
+  id: NonNullable<temporal.api.nexus.v1.IEndpoint['id']>;
+  version: NonNullable<temporal.api.nexus.v1.IEndpoint['version']>;
+  raw: temporal.api.nexus.v1.IEndpoint;
+};
 
 /**
  * Options for {@link TestWorkflowEnvironment.create}
@@ -320,6 +429,7 @@ export class TestWorkflowEnvironment {
 type TestWorkflowEnvironmentOptions = {
   server: DevServerConfig | TimeSkippingServerConfig | ExistingServerConfig;
   client?: ClientOptionsForTestEnv;
+  plugins?: (ClientPlugin | ConnectionPlugin | NativeConnectionPlugin)[];
 };
 
 type ExistingServerConfig = { type: 'existing' };
@@ -333,5 +443,6 @@ function addDefaults(opts: TestWorkflowEnvironmentOptions): TestWorkflowEnvironm
     server: {
       ...opts.server,
     },
+    plugins: [],
   };
 }

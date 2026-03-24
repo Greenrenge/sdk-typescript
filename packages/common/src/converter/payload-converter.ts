@@ -45,6 +45,18 @@ export function toPayloads(converter: PayloadConverter, ...values: unknown[]): P
 }
 
 /**
+ * Run {@link PayloadConverter.toPayload} on an optional value, and then encode it.
+ */
+export function convertOptionalToPayload(
+  payloadConverter: PayloadConverter,
+  value: unknown
+): Payload | null | undefined {
+  if (value == null) return value;
+
+  return payloadConverter.toPayload(value);
+}
+
+/**
  * Run {@link PayloadConverter.toPayload} on each value in the map.
  *
  * @throws {@link ValueError} if conversion of any value in the map fails
@@ -74,7 +86,11 @@ export function fromPayloadsAtIndex<T>(converter: PayloadConverter, index: numbe
   if (payloads === undefined || payloads === null || index >= payloads.length) {
     return undefined as any;
   }
-  return converter.fromPayload(payloads[index]);
+  const payload = payloads?.[index];
+  if (!payload) {
+    return undefined as any;
+  }
+  return converter.fromPayload(payload);
 }
 
 /**
@@ -112,6 +128,10 @@ export class RawValue<T = unknown> {
 
   constructor(value: T, payloadConverter: PayloadConverter = defaultPayloadConverter) {
     this._payload = payloadConverter.toPayload(value);
+  }
+
+  static fromPayload(p: Payload): RawValue {
+    return new RawValue(p, identityPayloadConverter);
   }
 
   get payload(): Payload {
@@ -183,7 +203,7 @@ export class CompositePayloadConverter implements PayloadConverter {
       throw new ValueError('Missing payload metadata');
     }
 
-    const encoding = decode(payload.metadata[METADATA_ENCODING_KEY]);
+    const encoding = decode(payload.metadata[METADATA_ENCODING_KEY]!);
     const converter = this.converterByEncoding.get(encoding);
     if (converter === undefined) {
       throw new ValueError(`Unknown encoding: ${encoding}`);
@@ -300,3 +320,18 @@ export class DefaultPayloadConverter extends CompositePayloadConverter {
  * `const myConverter = new DefaultPayloadConverter({ protobufRoot })`
  */
 export const defaultPayloadConverter = new DefaultPayloadConverter();
+
+/**
+ * The identity payload converter returns the inputs it was given.
+ */
+class IdentityPayloadConverter implements PayloadConverter {
+  toPayload<T>(value: T): Payload {
+    return value as Payload;
+  }
+
+  fromPayload<T>(payload: Payload): T {
+    return payload as T;
+  }
+}
+
+const identityPayloadConverter = new IdentityPayloadConverter();

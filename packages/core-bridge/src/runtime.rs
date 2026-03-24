@@ -5,14 +5,12 @@ use futures::channel::mpsc::Receiver;
 use neon::prelude::*;
 use tracing::{Instrument, warn};
 
-use temporal_sdk_core::{
-    CoreRuntime, TokioRuntimeBuilder,
-    api::telemetry::{
-        CoreLog, OtelCollectorOptions as CoreOtelCollectorOptions,
-        PrometheusExporterOptions as CorePrometheusExporterOptions, metrics::CoreMeter,
-    },
-    telemetry::{build_otlp_metric_exporter, start_prometheus_metric_exporter},
+use temporalio_common::telemetry::{
+    CoreLog, OtelCollectorOptions as CoreOtelCollectorOptions,
+    PrometheusExporterOptions as CorePrometheusExporterOptions, metrics::CoreMeter,
 };
+use temporalio_common::telemetry::{build_otlp_metric_exporter, start_prometheus_metric_exporter};
+use temporalio_sdk_core::{CoreRuntime, TokioRuntimeBuilder};
 
 use bridge_macros::js_function;
 use tokio_stream::StreamExt as _;
@@ -20,6 +18,7 @@ use tokio_stream::StreamExt as _;
 use crate::{
     helpers::{handles::MutableFinalize, *},
     logs::LogEntry,
+    metrics::{BufferedMetricUpdate, MetricsCallBuffer},
 };
 
 #[macro_export]
@@ -36,6 +35,10 @@ macro_rules! enter_sync {
 pub fn init(cx: &mut neon::prelude::ModuleContext) -> neon::prelude::NeonResult<()> {
     cx.export_function("newRuntime", runtime_new)?;
     cx.export_function("runtimeShutdown", runtime_shutdown)?;
+    cx.export_function(
+        "runtimeRetrieveBufferedMetrics",
+        runtime_retrieve_buffered_metrics,
+    )?;
 
     Ok(())
 }
@@ -51,6 +54,9 @@ pub struct Runtime {
     // For some unknown reason, the otel metrics exporter will go crazy on shutdown in some
     // scenarios if we don't hold on to the `CoreOtelMeter` till the `Runtime` finally gets dropped.
     _otel_metrics_exporter: Option<Arc<dyn CoreMeter + 'static>>,
+
+    // Buffered metrics call buffer, if buffered metrics are enabled
+    pub(crate) metrics_call_buffer: Option<MetricsCallBuffer>,
 }
 
 /// Initialize Core global telemetry and create the tokio runtime required to run Core.
@@ -59,39 +65,62 @@ pub struct Runtime {
 pub fn runtime_new(
     bridge_options: config::RuntimeOptions,
 ) -> BridgeResult<OpaqueOutboundHandle<Runtime>> {
-    let (telemetry_options, metrics_options, logging_options) = bridge_options.try_into()?;
+    let (telemetry_options, metrics_options, logging_options, worker_heartbeat_interval_millis) =
+        bridge_options.try_into()?;
 
     // Create core runtime which starts tokio multi-thread runtime
-    let mut core_runtime = CoreRuntime::new(telemetry_options, TokioRuntimeBuilder::default())
+    let runtime_options = temporalio_sdk_core::RuntimeOptions::builder()
+        .telemetry_options(telemetry_options)
+        .heartbeat_interval(worker_heartbeat_interval_millis.map(Duration::from_millis))
+        .build()
+        .map_err(|err| BridgeError::TypeError {
+            message: format!("Failed to build runtime options: {err}"),
+            field: None,
+        })?;
+    let mut core_runtime = CoreRuntime::new(runtime_options, TokioRuntimeBuilder::default())
         .context("Failed to initialize Core Runtime")?;
 
     enter_sync!(core_runtime);
 
     // Run the metrics exporter task, if needed. Created after Runtime since it needs Tokio handle
-    let (prom_metrics_exporter_task, otel_metrics_exporter) = match metrics_options {
-        Some(BridgeMetricsExporter::Prometheus(prom_opts)) => {
-            let exporter = start_prometheus_metric_exporter(prom_opts)
-                .context("Failed to start prometheus metrics exporter")?;
+    let (prom_metrics_exporter_task, otel_metrics_exporter, metrics_call_buffer) =
+        match metrics_options {
+            Some(BridgeMetricsExporter::Prometheus(prom_opts)) => {
+                let exporter = start_prometheus_metric_exporter(prom_opts)
+                    .context("Failed to start prometheus metrics exporter")?;
 
-            core_runtime
-                .telemetry_mut()
-                .attach_late_init_metrics(exporter.meter);
+                core_runtime
+                    .telemetry_mut()
+                    .attach_late_init_metrics(exporter.meter);
 
-            (Some(exporter.abort_handle), None)
-        }
-        Some(BridgeMetricsExporter::Otel(otel_opts)) => {
-            let exporter = build_otlp_metric_exporter(otel_opts)
-                .context("Failed to start OTel metrics exporter")?;
+                (Some(exporter.abort_handle), None, None)
+            }
+            Some(BridgeMetricsExporter::Otel(otel_opts)) => {
+                let exporter = build_otlp_metric_exporter(otel_opts)
+                    .context("Failed to start OTel metrics exporter")?;
 
-            let exporter: Arc<dyn CoreMeter + 'static> = Arc::new(exporter);
-            core_runtime
-                .telemetry_mut()
-                .attach_late_init_metrics(exporter.clone());
+                let exporter: Arc<dyn CoreMeter + 'static> = Arc::new(exporter);
+                core_runtime
+                    .telemetry_mut()
+                    .attach_late_init_metrics(exporter.clone());
 
-            (None, Some(exporter))
-        }
-        None => (None, None),
-    };
+                (None, Some(exporter), None)
+            }
+            Some(BridgeMetricsExporter::Buffer {
+                max_buffer_size,
+                use_seconds_for_durations,
+            }) => {
+                let metrics_call_buffer =
+                    MetricsCallBuffer::new(max_buffer_size, use_seconds_for_durations);
+
+                core_runtime
+                    .telemetry_mut()
+                    .attach_late_init_metrics(metrics_call_buffer.core_buffer.clone());
+
+                (None, None, Some(metrics_call_buffer))
+            }
+            None => (None, None, None),
+        };
 
     // Run the log exporter task, if needed. Created after Runtime since it needs Tokio handle.
     let log_exporter_task = if let BridgeLogExporter::Push { stream, receiver } = logging_options {
@@ -121,6 +150,7 @@ pub fn runtime_new(
         log_exporter_task,
         metrics_exporter_task: prom_metrics_exporter_task.map(Arc::new),
         _otel_metrics_exporter: otel_metrics_exporter,
+        metrics_call_buffer,
     }))
 }
 
@@ -132,6 +162,24 @@ pub fn runtime_new(
 pub fn runtime_shutdown(runtime: OpaqueInboundHandle<Runtime>) -> BridgeResult<()> {
     std::mem::drop(runtime.take()?);
     Ok(())
+}
+
+/// Retrieve buffered metrics from the runtime.
+///
+/// This function drains the metrics buffer and returns all metric updates that have been
+/// accumulated since the last call to this function.
+#[js_function]
+pub fn runtime_retrieve_buffered_metrics(
+    runtime: OpaqueInboundHandle<Runtime>,
+) -> BridgeResult<Vec<BufferedMetricUpdate>> {
+    let runtime = runtime.borrow()?;
+    let buffer = runtime.metrics_call_buffer.as_ref().ok_or_else(|| {
+        BridgeError::UnexpectedError(
+            "Attempting to retrieve buffered metrics of a runtime without buffer".into(),
+        )
+    })?;
+
+    Ok(buffer.retrieve())
 }
 
 /// Drop will handle the cleanup
@@ -217,6 +265,10 @@ impl RuntimeExt for Arc<CoreRuntime> {
 pub enum BridgeMetricsExporter {
     Prometheus(CorePrometheusExporterOptions),
     Otel(CoreOtelCollectorOptions),
+    Buffer {
+        max_buffer_size: usize,
+        use_seconds_for_durations: bool,
+    },
 }
 
 pub enum BridgeLogExporter {
@@ -232,20 +284,15 @@ pub enum BridgeLogExporter {
 mod config {
     use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
-    use anyhow::Context as _;
-
     use neon::prelude::*;
-    use temporal_sdk_core::{
-        Url,
-        api::telemetry::{
-            HistogramBucketOverrides, Logger as CoreTelemetryLogger, MetricTemporality,
-            OtelCollectorOptions as CoreOtelCollectorOptions, OtelCollectorOptionsBuilder,
-            OtlpProtocol, PrometheusExporterOptions as CorePrometheusExporterOptions,
-            PrometheusExporterOptionsBuilder, TelemetryOptions as CoreTelemetryOptions,
-            TelemetryOptionsBuilder,
-        },
-        telemetry::CoreLogStreamConsumer,
+    use temporalio_common::telemetry::CoreLogStreamConsumer;
+    use temporalio_common::telemetry::{
+        HistogramBucketOverrides, Logger as CoreTelemetryLogger, MetricTemporality,
+        OtelCollectorOptions as CoreOtelCollectorOptions, OtlpProtocol,
+        PrometheusExporterOptions as CorePrometheusExporterOptions,
+        TelemetryOptions as CoreTelemetryOptions,
     };
+    use temporalio_sdk_core::Url;
 
     use bridge_macros::TryFromJs;
 
@@ -264,6 +311,7 @@ mod config {
         log_exporter: LogExporterOptions,
         telemetry: TelemetryOptions,
         metrics_exporter: Option<MetricsExporterOptions>,
+        worker_heartbeat_interval_millis: Option<u64>,
     }
 
     #[derive(Debug, Clone, TryFromJs)]
@@ -287,6 +335,7 @@ mod config {
     pub(super) enum MetricsExporterOptions {
         Prometheus(PrometheusMetricsExporterConfig),
         Otel(OtelMetricsExporterConfig),
+        Buffer(BufferedMetricsExporterConfig),
     }
 
     #[derive(Debug, Clone, TryFromJs)]
@@ -311,6 +360,12 @@ mod config {
         protocol: StringEncoded<OtlpProtocol>,
     }
 
+    #[derive(Debug, Clone, TryFromJs)]
+    pub(super) struct BufferedMetricsExporterConfig {
+        max_buffer_size: usize,
+        use_seconds_for_durations: bool,
+    }
+
     /// A private newtype so that we can implement `TryFromJs` on simple externally defined enums
     #[derive(Debug, Clone)]
     struct StringEncoded<T>(T);
@@ -320,6 +375,7 @@ mod config {
             CoreTelemetryOptions,
             Option<super::BridgeMetricsExporter>,
             super::BridgeLogExporter,
+            Option<u64>,
         )> for RuntimeOptions
     {
         type Error = BridgeError;
@@ -329,8 +385,16 @@ mod config {
             CoreTelemetryOptions,
             Option<super::BridgeMetricsExporter>,
             super::BridgeLogExporter,
+            Option<u64>,
         )> {
-            let (telemetry_logger, log_exporter) = match self.log_exporter {
+            let Self {
+                log_exporter,
+                telemetry,
+                metrics_exporter,
+                worker_heartbeat_interval_millis,
+            } = self;
+
+            let (telemetry_logger, log_exporter) = match log_exporter {
                 LogExporterOptions::Console { filter } => (
                     CoreTelemetryLogger::Console { filter },
                     BridgeLogExporter::Console,
@@ -347,20 +411,22 @@ mod config {
                 }
             };
 
-            let mut telemetry_options = TelemetryOptionsBuilder::default();
-            let telemetry_options = telemetry_options
+            let telemetry_options = CoreTelemetryOptions::builder()
                 .logging(telemetry_logger)
-                .metric_prefix(self.telemetry.metric_prefix)
-                .attach_service_name(self.telemetry.attach_service_name)
-                .build()
-                .context("Failed to build telemetry options")?;
+                .metric_prefix(telemetry.metric_prefix)
+                .attach_service_name(telemetry.attach_service_name)
+                .build();
 
-            let metrics_exporter = self
-                .metrics_exporter
+            let metrics_exporter = metrics_exporter
                 .map(std::convert::TryInto::try_into)
                 .transpose()?;
 
-            Ok((telemetry_options, metrics_exporter, log_exporter))
+            Ok((
+                telemetry_options,
+                metrics_exporter,
+                log_exporter,
+                worker_heartbeat_interval_millis,
+            ))
         }
     }
 
@@ -372,6 +438,10 @@ mod config {
                     Ok(super::BridgeMetricsExporter::Prometheus(prom.try_into()?))
                 }
                 Self::Otel(otel) => Ok(super::BridgeMetricsExporter::Otel(otel.try_into()?)),
+                Self::Buffer(buffered) => Ok(super::BridgeMetricsExporter::Buffer {
+                    max_buffer_size: buffered.max_buffer_size,
+                    use_seconds_for_durations: buffered.use_seconds_for_durations,
+                }),
             }
         }
     }
@@ -380,8 +450,7 @@ mod config {
         type Error = BridgeError;
 
         fn try_into(self) -> BridgeResult<CorePrometheusExporterOptions> {
-            let mut options = PrometheusExporterOptionsBuilder::default();
-            let options = options
+            let options = CorePrometheusExporterOptions::builder()
                 .socket_addr(self.socket_addr)
                 .counters_total_suffix(self.counters_total_suffix)
                 .unit_suffix(self.unit_suffix)
@@ -390,8 +459,7 @@ mod config {
                     overrides: self.histogram_bucket_overrides,
                 })
                 .global_tags(self.global_tags)
-                .build()
-                .context("Failed to build prometheus exporter options")?;
+                .build();
 
             Ok(options)
         }
@@ -401,8 +469,7 @@ mod config {
         type Error = BridgeError;
 
         fn try_into(self) -> BridgeResult<CoreOtelCollectorOptions> {
-            let mut options = OtelCollectorOptionsBuilder::default();
-            let options = options
+            let options = CoreOtelCollectorOptions::builder()
                 .url(self.url)
                 .protocol(*self.protocol)
                 .headers(self.headers)
@@ -413,8 +480,7 @@ mod config {
                     overrides: self.histogram_bucket_overrides,
                 })
                 .global_tags(self.global_tags)
-                .build()
-                .context("Failed to build otel exporter options")?;
+                .build();
 
             Ok(options)
         }

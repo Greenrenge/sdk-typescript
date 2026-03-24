@@ -1,6 +1,7 @@
 import * as os from 'node:os';
 import * as v8 from 'node:v8';
 import type { Configuration as WebpackConfiguration } from 'webpack';
+import * as nexus from 'nexus-rpc';
 import {
   ActivityFunction,
   DataConverter,
@@ -26,6 +27,7 @@ import { InjectedSinks } from './sinks';
 import { MiB } from './utils';
 import { WorkflowBundleWithSourceMap } from './workflow/bundler';
 import { asNativeTuner, WorkerTuner } from './worker-tuner';
+import type { Worker } from './worker';
 
 /**
  * Options to configure the {@link Worker}
@@ -69,8 +71,7 @@ export interface WorkerOptions {
    *
    * @default `@temporalio/worker` package name and version + checksum of workflow bundle's code
    *
-   * @experimental The Worker Versioning API is still being designed. Major changes are expected.
-   * @deprecated Use {@link workerDeploymentOptions} instead.
+   * @deprecated Worker Versioning is now deprecated. Use {@link workerDeploymentOptions} instead: https://docs.temporal.io/worker-deployments
    */
   buildId?: string;
 
@@ -81,15 +82,12 @@ export interface WorkerOptions {
    *
    * For more information, see https://docs.temporal.io/workers#worker-versioning
    *
-   * @experimental The Worker Versioning API is still being designed. Major changes are expected.
-   * @deprecated Use {@link workerDeploymentOptions} instead.
+   * @deprecated Worker Versioning is now deprecated. Use {@link workerDeploymentOptions} instead: https://docs.temporal.io/worker-deployments
    */
   useVersioning?: boolean;
 
   /**
    * Deployment options for the worker. Exclusive with `build_id` and `use_worker_versioning`.
-   *
-   * @experimental Deployment based versioning is still experimental.
    */
   workerDeploymentOptions?: WorkerDeploymentOptions;
 
@@ -109,6 +107,13 @@ export interface WorkerOptions {
    * Mapping of activity name to implementation
    */
   activities?: object;
+
+  /**
+   * An array of Nexus services
+   *
+   * @experimental Nexus support in Temporal SDK is experimental.
+   */
+  nexusServices?: nexus.ServiceHandler<any>[];
 
   /**
    * Path to look up workflows in, any function exported in this path will be registered as a Workflows in this Worker.
@@ -173,8 +178,6 @@ export interface WorkerOptions {
    *
    * Mutually exclusive with the {@link maxConcurrentWorkflowTaskExecutions}, {@link
    * maxConcurrentActivityTaskExecutions}, and {@link maxConcurrentLocalActivityExecutions} options.
-   *
-   * @experimental Worker Tuner is an experimental feature and may be subject to change.
    */
   tuner?: WorkerTuner;
 
@@ -199,6 +202,18 @@ export interface WorkerOptions {
   maxConcurrentLocalActivityExecutions?: number;
 
   /**
+   * Maximum number of Nexus tasks to execute concurrently.
+   * Adjust this to improve Worker resource consumption.
+   *
+   * Mutually exclusive with the {@link tuner} option.
+   *
+   * @default 100 if no {@link tuner} is set
+   *
+   * @experimental Nexus support in Temporal SDK is experimental.
+   */
+  maxConcurrentNexusTaskExecutions?: number;
+
+  /**
    * Whether or not to poll on the Activity task queue.
    *
    * If disabled and activities are registered on the Worker, it will run only local Activities.
@@ -213,7 +228,7 @@ export interface WorkerOptions {
    * Activities.) The Worker will not poll for new Activities if by doing so it might receive and execute an Activity
    * which would cause it to exceed this limit. Must be a positive number.
    *
-   * If unset, no rate limiting will be applied to Worker's Activities. (`tctl task-queue describe` will display the
+   * If unset, no rate limiting will be applied to Worker's Activities. (`temporal task-queue describe` will display the
    * absence of a limit as 100,000.)
    */
   maxActivitiesPerSecond?: number;
@@ -315,6 +330,15 @@ export interface WorkerOptions {
   activityTaskPollerBehavior?: PollerBehavior;
 
   /**
+   * Specify the behavior of Nexus task polling.
+   *
+   * @default A fixed maximum whose value is min(10, maxConcurrentNexusTaskExecutions).
+   *
+   * @experimental Nexus support in Temporal SDK is experimental.
+   */
+  nexusTaskPollerBehavior?: PollerBehavior;
+
+  /**
    * Maximum number of Activity tasks to poll concurrently.
    *
    * Increase this setting if your Worker is failing to fill in all of its
@@ -324,6 +348,20 @@ export interface WorkerOptions {
    * @default min(10, maxConcurrentActivityTaskExecutions)
    */
   maxConcurrentActivityTaskPolls?: number;
+
+  /**
+   * Maximum number of Nexus tasks to poll concurrently.
+   *
+   * Increase this setting if your Worker is failing to fill in all of its
+   * `maxConcurrentNexusTaskExecutions` slots despite a low match rate of Nexus
+   * Tasks in the Task Queue (ie. due to network latency). Can't be higher than
+   * `maxConcurrentNexusTaskExecutions`.
+   *
+   * @default min(10, maxConcurrentNexusTaskExecutions)
+   *
+   * @experimental Nexus support in Temporal SDK is experimental.
+   */
+  maxConcurrentNexusTaskPolls?: number;
 
   /**
    * How long a workflow task is allowed to sit on the sticky queue before it is timed out
@@ -441,6 +479,21 @@ export interface WorkerOptions {
   interceptors?: WorkerInterceptors;
 
   /**
+   * List of plugins to register with the worker.
+   *
+   * Plugins allow you to extend and customize the behavior of Temporal workers.
+   * They can intercept and modify worker creation, configuration, and execution.
+   *
+   * Worker plugins can be used to add custom activities, workflows, interceptors, or modify other
+   * worker settings before the worker is fully initialized.
+   *
+   * Any plugins provided will also be passed to the bundler if used.
+   *
+   * @experimental Plugins is an experimental feature; APIs may change without notice.
+   */
+  plugins?: WorkerPlugin[];
+
+  /**
    * Registration of a {@link SinkFunction}, including per-sink-function options.
    *
    * Sinks are a mechanism for exporting data out of the Workflow sandbox. They are typically used
@@ -536,8 +589,6 @@ export type PollerBehavior = PollerBehaviorSimpleMaximum | PollerBehaviorAutosca
 /**
  * A poller behavior that will automatically scale the number of pollers based on feedback
  * from the server. A slot must be available before beginning polling.
- *
- * @experimental Poller autoscaling is currently experimental and may change in future versions.
  */
 export interface PollerBehaviorAutoscaling {
   type: 'autoscaling';
@@ -567,8 +618,9 @@ export interface PollerBehaviorSimpleMaximum {
   type: 'simple-maximum';
   /**
    * The maximum poller number, assumes the same default as described in
-   * {@link WorkerOptions.maxConcurrentWorkflowTaskPolls} or
-   * {@link WorkerOptions.maxConcurrentActivityTaskPolls}.
+   * {@link WorkerOptions.maxConcurrentWorkflowTaskPolls},
+   * {@link WorkerOptions.maxConcurrentActivityTaskPolls}, or
+   * {@link WorkerOptions.maxConcurrentNexusTaskPolls} .
    */
   maximum?: number;
 }
@@ -576,8 +628,6 @@ export interface PollerBehaviorSimpleMaximum {
 /**
  * Allows specifying the deployment version of the worker and whether to use deployment-based
  * worker versioning.
- *
- * @experimental Deployment based versioning is still experimental.
  */
 export type WorkerDeploymentOptions = {
   /**
@@ -591,11 +641,21 @@ export type WorkerDeploymentOptions = {
   useWorkerVersioning: boolean;
 
   /**
-   * The default versioning behavior to use for all workflows on this worker. Specifying a default
-   * behavior is required.
+   * The default versioning behavior to use for all workflows on this worker.
+   *
+   * Required if {@link useWorkerVersioning} is `true`; should be left unset otherwise.
    */
-  defaultVersioningBehavior: VersioningBehavior;
-};
+  defaultVersioningBehavior?: VersioningBehavior | undefined;
+} & (
+  | {
+      useWorkerVersioning: true;
+      defaultVersioningBehavior: VersioningBehavior;
+    }
+  | {
+      useWorkerVersioning: false;
+      defaultVersioningBehavior?: never;
+    }
+);
 
 // Replay Worker ///////////////////////////////////////////////////////////////////////////////////
 
@@ -609,14 +669,18 @@ export interface ReplayWorkerOptions
     | 'namespace'
     | 'taskQueue'
     | 'activities'
+    | 'nexusServices'
     | 'tuner'
     | 'maxConcurrentActivityTaskExecutions'
     | 'maxConcurrentLocalActivityExecutions'
     | 'maxConcurrentWorkflowTaskExecutions'
+    | 'maxConcurrentNexusTaskExecutions'
     | 'maxConcurrentActivityTaskPolls'
     | 'maxConcurrentWorkflowTaskPolls'
+    | 'maxConcurrentNexusTaskPolls'
     | 'workflowTaskPollerBehavior'
     | 'activityTaskPollerBehavior'
+    | 'nexusTaskPollerBehavior'
     | 'nonStickyToStickyPollRatio'
     | 'maxHeartbeatThrottleInterval'
     | 'defaultHeartbeatThrottleInterval'
@@ -664,7 +728,7 @@ export type WorkflowBundleOption =
   | WorkflowBundle
   | WorkflowBundleWithSourceMap
   | WorkflowBundlePath
-  | WorkflowBundlePathWithSourceMap; // eslint-disable-line deprecation/deprecation
+  | WorkflowBundlePathWithSourceMap; // eslint-disable-line @typescript-eslint/no-deprecated
 
 export function isCodeBundleOption(bundleOpt: WorkflowBundleOption): bundleOpt is WorkflowBundle {
   const opt = bundleOpt as any; // Cast to access properties without TS complaining
@@ -685,7 +749,7 @@ export function isPathBundleOption(bundleOpt: WorkflowBundleOption): bundleOpt i
  * @deprecated Calling `defaultSink()` is no longer required. To configure a custom logger, set the
  *             {@link Runtime.logger} property instead.
  */
-// eslint-disable-next-line deprecation/deprecation
+// eslint-disable-next-line @typescript-eslint/no-deprecated
 export function defaultSinks(logger?: Logger): InjectedSinks<LoggerSinks> {
   // initLoggerSink() returns a sink that complies to the new LoggerSinksInternal API (ie. named __temporal_logger), but
   // code that is still calling defaultSinks() expects return type to match the deprecated LoggerSinks API. Silently
@@ -695,12 +759,12 @@ export function defaultSinks(logger?: Logger): InjectedSinks<LoggerSinks> {
   // If no logger was provided, the legacy behavior was to _lazily_ set the sink's logger to the Runtime's logger.
   // This was required because we may call defaultSinks() before the Runtime is initialized. We preserve that behavior
   // here by silently not initializing the sink if no logger is provided.
-  // eslint-disable-next-line deprecation/deprecation
+  // eslint-disable-next-line @typescript-eslint/no-deprecated
   if (!logger) return {} as InjectedSinks<LoggerSinks>;
 
   // Register the logger sink with its historical name
   const { __temporal_logger: defaultWorkerLogger } = initLoggerSink(logger);
-  return { defaultWorkerLogger } satisfies InjectedSinks<LoggerSinks>; // eslint-disable-line deprecation/deprecation
+  return { defaultWorkerLogger } satisfies InjectedSinks<LoggerSinks>; // eslint-disable-line @typescript-eslint/no-deprecated
 }
 
 /**
@@ -719,9 +783,9 @@ export function appendDefaultInterceptors(
 
   return {
     activityInbound: [
-      // eslint-disable-next-line deprecation/deprecation
+      // eslint-disable-next-line @typescript-eslint/no-deprecated
       (ctx) => new ActivityInboundLogInterceptor(ctx, logger),
-      // eslint-disable-next-line deprecation/deprecation
+      // eslint-disable-next-line @typescript-eslint/no-deprecated
       ...(interceptors.activityInbound ?? []),
     ],
     activity: interceptors.activity,
@@ -730,12 +794,19 @@ export function appendDefaultInterceptors(
 }
 
 function compileWorkerInterceptors({
+  client,
   activity,
-  activityInbound, // eslint-disable-line deprecation/deprecation
+  activityInbound, // eslint-disable-line @typescript-eslint/no-deprecated
+  nexus,
   workflowModules,
 }: Required<WorkerInterceptors>): CompiledWorkerInterceptors {
   return {
+    client: {
+      workflow: client?.workflow ?? [],
+      schedule: client?.schedule ?? [],
+    },
     activity: [...activityInbound.map((factory) => (ctx: Context) => ({ inbound: factory(ctx) })), ...activity],
+    nexus: nexus ?? [],
     workflowModules,
   };
 }
@@ -780,6 +851,7 @@ export type WorkerOptionsWithDefaults = WorkerOptions &
 
     workflowTaskPollerBehavior: Required<PollerBehavior>;
     activityTaskPollerBehavior: Required<PollerBehavior>;
+    nexusTaskPollerBehavior: Required<PollerBehavior>;
   };
 
 /**
@@ -787,7 +859,7 @@ export type WorkerOptionsWithDefaults = WorkerOptions &
  * formatted strings to numbers.
  */
 export interface CompiledWorkerOptions
-  extends Omit<WorkerOptionsWithDefaults, 'interceptors' | 'activities' | 'tuner'> {
+  extends Omit<WorkerOptionsWithDefaults, 'interceptors' | 'activities' | 'nexusServices' | 'tuner'> {
   interceptors: CompiledWorkerInterceptors;
   shutdownGraceTimeMs: number;
   shutdownForceTimeMs?: number;
@@ -797,6 +869,7 @@ export interface CompiledWorkerOptions
   defaultHeartbeatThrottleIntervalMs: number;
   loadedDataConverter: LoadedDataConverter;
   activities: Map<string, ActivityFunction>;
+  nexusServiceRegistry?: nexus.ServiceRegistry;
   tuner: native.WorkerTunerOptions;
 }
 
@@ -810,8 +883,8 @@ function addDefaultWorkerOptions(
   metricMeter: MetricMeter
 ): WorkerOptionsWithDefaults {
   const {
-    buildId, // eslint-disable-line deprecation/deprecation
-    useVersioning, // eslint-disable-line deprecation/deprecation
+    buildId, // eslint-disable-line @typescript-eslint/no-deprecated
+    useVersioning, // eslint-disable-line @typescript-eslint/no-deprecated
     maxCachedWorkflows,
     showStackTraceSources,
     namespace,
@@ -821,8 +894,10 @@ function addDefaultWorkerOptions(
     maxConcurrentActivityTaskExecutions,
     maxConcurrentLocalActivityExecutions,
     maxConcurrentWorkflowTaskExecutions,
+    maxConcurrentNexusTaskExecutions,
     workflowTaskPollerBehavior,
     activityTaskPollerBehavior,
+    nexusTaskPollerBehavior,
     ...rest
   } = options;
   const debugMode = options.debugMode || isSet(process.env.TEMPORAL_DEBUG);
@@ -841,6 +916,7 @@ function addDefaultWorkerOptions(
   // Difficult to predict appropriate poll numbers for resource based slots
   let maxWFTPolls = 10;
   let maxATPolls = 10;
+  let maxNexusTaskPolls = 10;
   let setTuner: WorkerTuner;
   if (rest.tuner !== undefined) {
     if (maxConcurrentActivityTaskExecutions !== undefined) {
@@ -855,10 +931,12 @@ function addDefaultWorkerOptions(
     setTuner = rest.tuner;
   } else {
     const maxWft = maxConcurrentWorkflowTaskExecutions ?? 40;
-    maxWFTPolls = Math.min(10, maxWft);
+    maxWFTPolls = Math.min(maxWFTPolls, maxWft);
     const maxAT = maxConcurrentActivityTaskExecutions ?? 100;
-    maxATPolls = Math.min(10, maxAT);
+    maxATPolls = Math.min(maxATPolls, maxAT);
     const maxLAT = maxConcurrentLocalActivityExecutions ?? 100;
+    const maxNexusTasks = maxConcurrentNexusTaskExecutions ?? 100;
+    maxNexusTaskPolls = Math.min(maxNexusTaskPolls, maxNexusTasks);
     setTuner = {
       workflowTaskSlotSupplier: {
         type: 'fixed-size',
@@ -871,6 +949,10 @@ function addDefaultWorkerOptions(
       localActivityTaskSlotSupplier: {
         type: 'fixed-size',
         numSlots: maxLAT,
+      },
+      nexusTaskSlotSupplier: {
+        type: 'fixed-size',
+        numSlots: maxNexusTasks,
       },
     };
   }
@@ -889,6 +971,7 @@ function addDefaultWorkerOptions(
 
   const wftPollerBehavior = createPollerBehavior(maxWFTPolls, workflowTaskPollerBehavior);
   const atPollerBehavior = createPollerBehavior(maxATPolls, activityTaskPollerBehavior);
+  const nexusPollerBehavior = createPollerBehavior(maxNexusTaskPolls, nexusTaskPollerBehavior);
 
   return {
     namespace: namespace ?? 'default',
@@ -899,6 +982,7 @@ function addDefaultWorkerOptions(
     enableNonLocalActivities: true,
     workflowTaskPollerBehavior: wftPollerBehavior,
     activityTaskPollerBehavior: atPollerBehavior,
+    nexusTaskPollerBehavior: nexusPollerBehavior,
     stickyQueueScheduleToStartTimeout: '10s',
     maxHeartbeatThrottleInterval: '60s',
     defaultHeartbeatThrottleInterval: '30s',
@@ -909,8 +993,13 @@ function addDefaultWorkerOptions(
     showStackTraceSources: showStackTraceSources ?? false,
     debugMode: debugMode ?? false,
     interceptors: {
+      client: {
+        workflow: interceptors?.client?.workflow ?? [],
+        schedule: interceptors?.client?.schedule ?? [],
+      },
       activity: interceptors?.activity ?? [],
-      // eslint-disable-next-line deprecation/deprecation
+      nexus: interceptors?.nexus ?? [],
+      // eslint-disable-next-line @typescript-eslint/no-deprecated
       activityInbound: interceptors?.activityInbound ?? [],
       workflowModules: interceptors?.workflowModules ?? [],
     },
@@ -979,16 +1068,26 @@ export function compileWorkerOptions(
     defaultHeartbeatThrottleIntervalMs: msToNumber(opts.defaultHeartbeatThrottleInterval),
     loadedDataConverter: loadDataConverter(opts.dataConverter),
     activities,
+    nexusServiceRegistry: nexusServiceRegistryFromOptions(opts),
     enableNonLocalActivities: opts.enableNonLocalActivities && activities.size > 0,
     tuner,
   };
 }
 
+function nexusServiceRegistryFromOptions(opts: WorkerOptions): nexus.ServiceRegistry | undefined {
+  if (opts.nexusServices == null || opts.nexusServices.length === 0) {
+    return undefined;
+  }
+  return nexus.ServiceRegistry.create(opts.nexusServices);
+}
+
 export function toNativeWorkerOptions(opts: CompiledWorkerOptionsWithBuildId): native.WorkerOptions {
+  const enableWorkflows = opts.workflowBundle !== undefined || opts.workflowsPath !== undefined;
+  const enableLocalActivities = enableWorkflows && opts.activities.size > 0;
   return {
     identity: opts.identity,
-    buildId: opts.buildId, // eslint-disable-line deprecation/deprecation
-    useVersioning: opts.useVersioning, // eslint-disable-line deprecation/deprecation
+    buildId: opts.buildId, // eslint-disable-line @typescript-eslint/no-deprecated
+    useVersioning: opts.useVersioning, // eslint-disable-line @typescript-eslint/no-deprecated
     workerDeploymentOptions: toNativeDeploymentOptions(opts.workerDeploymentOptions),
     taskQueue: opts.taskQueue,
     namespace: opts.namespace,
@@ -996,7 +1095,13 @@ export function toNativeWorkerOptions(opts: CompiledWorkerOptionsWithBuildId): n
     nonStickyToStickyPollRatio: opts.nonStickyToStickyPollRatio,
     workflowTaskPollerBehavior: toNativeTaskPollerBehavior(opts.workflowTaskPollerBehavior),
     activityTaskPollerBehavior: toNativeTaskPollerBehavior(opts.activityTaskPollerBehavior),
-    enableNonLocalActivities: opts.enableNonLocalActivities,
+    nexusTaskPollerBehavior: toNativeTaskPollerBehavior(opts.nexusTaskPollerBehavior),
+    taskTypes: {
+      enableWorkflows,
+      enableLocalActivities,
+      enableRemoteActivities: opts.enableNonLocalActivities && opts.activities.size > 0,
+      enableNexus: opts.nexusServiceRegistry !== undefined,
+    },
     stickyQueueScheduleToStartTimeout: msToNumber(opts.stickyQueueScheduleToStartTimeout),
     maxCachedWorkflows: opts.maxCachedWorkflows,
     maxHeartbeatThrottleInterval: msToNumber(opts.maxHeartbeatThrottleInterval),
@@ -1004,6 +1109,7 @@ export function toNativeWorkerOptions(opts: CompiledWorkerOptionsWithBuildId): n
     maxTaskQueueActivitiesPerSecond: opts.maxTaskQueueActivitiesPerSecond ?? null,
     maxActivitiesPerSecond: opts.maxActivitiesPerSecond ?? null,
     shutdownGraceTime: msToNumber(opts.shutdownGraceTime),
+    plugins: opts.plugins?.map((p) => p.name) ?? [],
   };
 }
 
@@ -1030,8 +1136,16 @@ function toNativeDeploymentOptions(options?: WorkerDeploymentOptions): native.Wo
   if (options === undefined) {
     return null;
   }
+  if (!options.useWorkerVersioning) {
+    return {
+      version: options.version,
+      useWorkerVersioning: false,
+      defaultVersioningBehavior: null,
+    };
+  }
+  const { defaultVersioningBehavior } = options;
   let vb: native.VersioningBehavior;
-  switch (options.defaultVersioningBehavior) {
+  switch (defaultVersioningBehavior) {
     case 'PINNED':
       vb = { type: 'pinned' };
       break;
@@ -1039,14 +1153,55 @@ function toNativeDeploymentOptions(options?: WorkerDeploymentOptions): native.Wo
       vb = { type: 'auto-upgrade' };
       break;
     default:
-      options.defaultVersioningBehavior satisfies never;
-      throw new Error(`Unknown versioning behavior: ${options.defaultVersioningBehavior}`);
+      defaultVersioningBehavior satisfies never;
+      throw new Error(`Unknown versioning behavior: ${defaultVersioningBehavior}`);
   }
   return {
     version: options.version,
-    useWorkerVersioning: options.useWorkerVersioning,
+    useWorkerVersioning: true,
     defaultVersioningBehavior: vb,
   };
+}
+
+/**
+ * Plugin interface for worker functionality.
+ *
+ * Plugins provide a way to extend and customize the behavior of Temporal workers.
+ * They allow you to intercept and modify worker configuration and worker execution.
+ *
+ * @experimental Plugins is an experimental feature; APIs may change without notice.
+ */
+export interface WorkerPlugin {
+  /**
+   * Gets the name of this plugin.
+   */
+  get name(): string;
+
+  /**
+   * Hook called when creating a worker to allow modification of configuration.
+   *
+   * This method is called during worker creation and allows plugins to modify
+   * the worker configuration before the worker is fully initialized. Plugins
+   * can add activities, workflows, interceptors, or change other settings.
+   */
+  configureWorker?(options: WorkerOptions): WorkerOptions;
+
+  /**
+   * Hook called when creating a replay worker to allow modification of configuration.
+   *
+   * This method is called during worker creation and allows plugins to modify
+   * the worker configuration before the worker is fully initialized. Plugins
+   * can add workflows, interceptors, or change other settings.
+   */
+  configureReplayWorker?(options: ReplayWorkerOptions): ReplayWorkerOptions;
+
+  /**
+   * Hook called when running a worker.
+   *
+   * This method is not called when running a replay worker, as activities will not be
+   * executed, and global state can't affect the workflow.
+   */
+  runWorker?(worker: Worker, next: (w: Worker) => Promise<void>): Promise<void>;
 }
 
 // Utils ///////////////////////////////////////////////////////////////////////////////////////////

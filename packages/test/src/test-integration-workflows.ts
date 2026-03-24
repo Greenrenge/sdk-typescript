@@ -3,7 +3,7 @@ import { randomUUID } from 'crypto';
 import asyncRetry from 'async-retry';
 import { ExecutionContext } from 'ava';
 import { firstValueFrom, Subject } from 'rxjs';
-import { WorkflowFailedError, WorkflowHandle } from '@temporalio/client';
+import { Client, WorkflowClient, WorkflowFailedError, WorkflowHandle } from '@temporalio/client';
 import * as activity from '@temporalio/activity';
 import { msToNumber, tsToMs } from '@temporalio/common/lib/time';
 import { TestWorkflowEnvironment } from '@temporalio/testing';
@@ -21,9 +21,12 @@ import {
 } from '@temporalio/workflow';
 import { SdkFlags } from '@temporalio/workflow/lib/flags';
 import {
+  ActivityCancellationDetails,
   ActivityCancellationType,
   ApplicationFailure,
   defineSearchAttributeKey,
+  encodingKeys,
+  METADATA_ENCODING_KEY,
   RawValue,
   SearchAttributePair,
   SearchAttributeType,
@@ -35,11 +38,13 @@ import {
   STACK_TRACE_QUERY_NAME,
   ENHANCED_STACK_TRACE_QUERY_NAME,
 } from '@temporalio/common/lib/reserved';
+import { encode } from '@temporalio/common/lib/encoding';
 import { signalSchedulingWorkflow } from './activities/helpers';
 import { activityStartedSignal } from './workflows/definitions';
 import * as workflows from './workflows';
 import { Context, createLocalTestEnvironment, helpers, makeTestFunction } from './helpers-integration';
 import { overrideSdkInternalFlag } from './mock-internal-flags';
+import { ActivityState, heartbeatCancellationDetailsActivity } from './activities/heartbeat-cancellation-details';
 import { loadHistory, RUN_TIME_SKIPPING_TESTS, waitUntil } from './helpers';
 
 const test = makeTestFunction({
@@ -436,7 +441,7 @@ export async function executeEagerActivity(): Promise<void> {
 }
 
 test('Worker requests Eager Activity Dispatch if possible', async (t) => {
-  const { createWorker, startWorkflow } = helpers(t);
+  const { createWorker, startWorkflow, createNativeConnection } = helpers(t);
 
   // If eager activity dispatch is working, then the task will always be dispatched to the workflow
   // worker. Otherwise, chances are 50%-50% for either workers. The test workflow schedule the
@@ -450,7 +455,10 @@ test('Worker requests Eager Activity Dispatch if possible', async (t) => {
     // Override the default workflow bundle, to make this an activity-only worker
     workflowBundle: undefined,
   });
+  const workflowWorkerConnection = await createNativeConnection();
+  t.teardown(() => workflowWorkerConnection.close());
   const workflowWorker = await createWorker({
+    connection: workflowWorkerConnection,
     activities: {
       testActivity: () => 'workflow-and-activity-worker',
     },
@@ -473,7 +481,7 @@ export async function dontExecuteEagerActivity(): Promise<string> {
 }
 
 test("Worker doesn't request Eager Activity Dispatch if no activities are registered", async (t) => {
-  const { createWorker, startWorkflow } = helpers(t);
+  const { createNativeConnection, createWorker, startWorkflow } = helpers(t);
 
   // If the activity was eagerly dispatched to the Workflow worker even though it is a Workflow-only
   // worker, then the activity execution will timeout (because tasks are not being polled) or
@@ -488,7 +496,10 @@ test("Worker doesn't request Eager Activity Dispatch if no activities are regist
     // Override the default workflow bundle, to make this an activity-only worker
     workflowBundle: undefined,
   });
+  const workflowWorkerConnection = await createNativeConnection();
+  t.teardown(() => workflowWorkerConnection.close());
   const workflowWorker = await createWorker({
+    connection: workflowWorkerConnection,
     activities: {},
   });
   const handle = await startWorkflow(dontExecuteEagerActivity);
@@ -512,7 +523,7 @@ export async function buildIdTester(): Promise<void> {
   });
 
   workflow.setHandler(getBuildIdQuery, () => {
-    return workflow.workflowInfo().currentBuildId ?? ''; // eslint-disable-line deprecation/deprecation
+    return workflow.workflowInfo().currentBuildId ?? ''; // eslint-disable-line @typescript-eslint/no-deprecated
   });
 
   // The unblock signal will only be sent once we are in Worker 1.1.
@@ -940,7 +951,7 @@ export async function cancellationScopeWithTimeoutTimerGetsCancelled(): Promise<
     // Fix enabled: this timer will get cancelled
   });
 
-  // Timer cancelation won't appear in history if it sent in the same WFT as workflow complete
+  // Timer cancellation won't appear in history if it sent in the same WFT as workflow complete
   await activitySleep(1);
 
   //@ts-expect-error TSC can't see that scope variables will be initialized synchronously
@@ -962,10 +973,10 @@ test('CancellationScope.withTimeout() - timer gets cancelled', async (t) => {
 
   const { events } = await handle.fetchHistory();
 
-  const timerCanceledEvents = events?.filter((ev) => ev.timerCanceledEventAttributes) ?? [];
-  t.is(timerCanceledEvents?.length, 1);
+  const timerCancelledEvents = events?.filter((ev) => ev.timerCanceledEventAttributes) ?? [];
+  t.is(timerCancelledEvents?.length, 1);
 
-  const timerStartedEventId = timerCanceledEvents[0].timerCanceledEventAttributes?.startedEventId;
+  const timerStartedEventId = timerCancelledEvents[0].timerCanceledEventAttributes?.startedEventId;
   const timerStartedEvent = events?.find((ev) => ev.eventId?.toNumber() === timerStartedEventId?.toNumber());
   t.is(tsToMs(timerStartedEvent?.timerStartedEventAttributes?.startToFireTimeout), msToNumber('12s'));
 });
@@ -989,7 +1000,7 @@ export async function cancellationScopeWithTimeoutScopeGetCancelledOnTimeout(): 
     await activitySleep(7000);
   }).catch(() => undefined);
 
-  // Activity cancelation won't appear in history if it sent in the same WFT as workflow complete
+  // Activity cancellation won't appear in history if it sent in the same WFT as workflow complete
   await activitySleep(1);
 
   //@ts-expect-error TSC can't see that scope variables will be initialized synchronously
@@ -1066,7 +1077,7 @@ export function setAndClearTimeoutInterceptors(): workflow.WorkflowInterceptors 
 }
 
 if (RUN_TIME_SKIPPING_TESTS) {
-  test('setTimeout and clearTimeout - works before and after 1.10.3', async (t) => {
+  test.serial('setTimeout and clearTimeout - works before and after 1.10.3', async (t) => {
     const env = await TestWorkflowEnvironment.createTimeSkipping();
     const { createWorker, startWorkflow } = helpers(t, env);
     try {
@@ -1160,7 +1171,7 @@ test("Lang's SDK flags replay correctly", async (t) => {
   await worker.runUntil(() => handle.result());
 
   const worker2 = await createWorker();
-  await worker2.runUntil(() => handle.query('__stack_trace'));
+  await worker2.runUntil(() => handle.query('__temporal_workflow_metadata'));
 
   // Query would have thrown if the workflow couldn't be replayed correctly
   t.pass();
@@ -1283,7 +1294,7 @@ test('Count workflow executions', async (t) => {
   });
 });
 
-test('can register search attributes to dev server', async (t) => {
+test.serial('can register search attributes to dev server', async (t) => {
   const key = defineSearchAttributeKey('new-search-attr', SearchAttributeType.INT);
   const newSearchAttribute: SearchAttributePair = { key, value: 12 };
 
@@ -1305,21 +1316,33 @@ test('can register search attributes to dev server', async (t) => {
   // Expect workflow description to have search attribute.
   const desc = await handle.describe();
   t.deepEqual(desc.typedSearchAttributes, new TypedSearchAttributes([newSearchAttribute]));
-  t.deepEqual(desc.searchAttributes, { 'new-search-attr': [12] }); // eslint-disable-line deprecation/deprecation
+  t.deepEqual(desc.searchAttributes, { 'new-search-attr': [12] }); // eslint-disable-line @typescript-eslint/no-deprecated
   await env.teardown();
 });
 
-export async function rawValueWorkflow(value: unknown): Promise<RawValue> {
+export async function rawValueWorkflow(value: unknown, isPayload: boolean = false): Promise<RawValue> {
   const { rawValueActivity } = workflow.proxyActivities({ startToCloseTimeout: '10s' });
-  return await rawValueActivity(new RawValue(value));
+  const rv = isPayload
+    ? RawValue.fromPayload({
+        metadata: { [METADATA_ENCODING_KEY]: encodingKeys.METADATA_ENCODING_RAW },
+        data: value as Uint8Array,
+      })
+    : new RawValue(value);
+  return await rawValueActivity(rv, isPayload);
 }
 
 test('workflow and activity can receive/return RawValue', async (t) => {
   const { executeWorkflow, createWorker } = helpers(t);
   const worker = await createWorker({
     activities: {
-      async rawValueActivity(value: unknown): Promise<RawValue> {
-        return new RawValue(value);
+      async rawValueActivity(value: unknown, isPayload: boolean = false): Promise<RawValue> {
+        const rv = isPayload
+          ? RawValue.fromPayload({
+              metadata: { [METADATA_ENCODING_KEY]: encodingKeys.METADATA_ENCODING_RAW },
+              data: value as Uint8Array,
+            })
+          : new RawValue(value);
+        return rv;
       },
     },
   });
@@ -1327,10 +1350,18 @@ test('workflow and activity can receive/return RawValue', async (t) => {
   await worker.runUntil(async () => {
     const testValue = 'test';
     const rawValue = new RawValue(testValue);
+    const rawValuePayload = RawValue.fromPayload({
+      metadata: { [METADATA_ENCODING_KEY]: encodingKeys.METADATA_ENCODING_RAW },
+      data: encode(testValue),
+    });
     const res = await executeWorkflow(rawValueWorkflow, {
       args: [rawValue],
     });
     t.deepEqual(res, testValue);
+    const res2 = await executeWorkflow(rawValueWorkflow, {
+      args: [rawValuePayload, true],
+    });
+    t.deepEqual(res2, encode(testValue));
   });
 });
 
@@ -1372,7 +1403,7 @@ test('root execution is exposed', async (t) => {
         }
       }
     };
-    await waitUntil(childStarted, 5000);
+    await waitUntil(childStarted, 8000);
     const childDesc = await childHandle.describe();
     const parentDesc = await handle.describe();
 
@@ -1406,6 +1437,119 @@ test('Workflow can return root workflow', async (t) => {
   await worker.runUntil(async () => {
     const result = await executeWorkflow(rootWorkflow, { workflowId: 'test-root-workflow-length' });
     t.deepEqual(result, 'empty test-root-workflow-length');
+  });
+});
+
+export async function heartbeatCancellationWorkflow(
+  state: ActivityState
+): Promise<ActivityCancellationDetails | undefined> {
+  const { heartbeatCancellationDetailsActivity } = workflow.proxyActivities({
+    startToCloseTimeout: '5s',
+    retry: {
+      maximumAttempts: 2,
+    },
+    heartbeatTimeout: '1s',
+  });
+
+  return await heartbeatCancellationDetailsActivity(state);
+}
+
+test('Activity pause returns expected cancellation details', async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+  const worker = await createWorker({
+    activities: {
+      heartbeatCancellationDetailsActivity,
+    },
+  });
+
+  await worker.runUntil(async () => {
+    const result = await executeWorkflow(heartbeatCancellationWorkflow, {
+      args: [{ pause: true }],
+    });
+
+    t.deepEqual(result, {
+      cancelRequested: false,
+      notFound: false,
+      paused: true,
+      timedOut: false,
+      workerShutdown: false,
+      reset: false,
+    });
+  });
+});
+
+test('Activity can be cancelled via pause and retry after unpause', async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+
+  const worker = await createWorker({
+    activities: {
+      heartbeatCancellationDetailsActivity,
+    },
+  });
+
+  await worker.runUntil(async () => {
+    const result = await executeWorkflow(heartbeatCancellationWorkflow, {
+      args: [{ pause: true, unpause: true, shouldRetry: true }],
+    });
+    // Note that we expect the result to be null because unpausing an activity
+    // resets the activity context (akin to starting the activity anew)
+    t.true(result == null);
+  });
+});
+
+test('Activity reset without retry returns expected cancellation details', async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+  const worker = await createWorker({
+    activities: {
+      heartbeatCancellationDetailsActivity,
+    },
+  });
+
+  await worker.runUntil(async () => {
+    const result = await executeWorkflow(heartbeatCancellationWorkflow, { args: [{ reset: true }] });
+    t.deepEqual(result, {
+      cancelRequested: false,
+      notFound: false,
+      paused: false,
+      timedOut: false,
+      workerShutdown: false,
+      reset: true,
+    });
+  });
+});
+
+test('Activity reset with retry returns expected cancellation details', async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+  const worker = await createWorker({
+    activities: {
+      heartbeatCancellationDetailsActivity,
+    },
+  });
+
+  await worker.runUntil(async () => {
+    const result = await executeWorkflow(heartbeatCancellationWorkflow, { args: [{ reset: true, shouldRetry: true }] });
+    t.true(result == null);
+  });
+});
+
+test('Activity paused and reset returns expected cancellation details', async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+  const worker = await createWorker({
+    activities: {
+      heartbeatCancellationDetailsActivity,
+    },
+  });
+
+  await worker.runUntil(async () => {
+    const result = await executeWorkflow(heartbeatCancellationWorkflow, { args: [{ pause: true, reset: true }] });
+    t.deepEqual(result, {
+      cancelRequested: false,
+      notFound: false,
+      paused: true,
+      timedOut: false,
+      workerShutdown: false,
+      reset: true,
+    });
   });
 });
 
@@ -1636,4 +1780,50 @@ test('Default handlers fail given reserved prefix', async (t) => {
     );
     await handle.terminate();
   });
+});
+
+export async function helloWorkflow(name: string): Promise<string> {
+  return `Hello, ${name}!`;
+}
+
+test('Workflow can be started eagerly with shared NativeConnection', async (t) => {
+  const { createWorker, taskQueue } = helpers(t);
+  const client = new Client({
+    connection: t.context.env.nativeConnection,
+    namespace: t.context.env.client.options.namespace,
+  });
+
+  const worker = await createWorker();
+  await worker.runUntil(async () => {
+    const handle = await client.workflow.start(helloWorkflow, {
+      args: ['Temporal'],
+      workflowId: `eager-workflow-${randomUUID()}`,
+      taskQueue,
+      requestEagerStart: true,
+      workflowTaskTimeout: '1h', // hang if retry needed
+    });
+
+    t.true(handle.eagerlyStarted);
+
+    const result = await handle.result();
+    t.is(result, 'Hello, Temporal!');
+  });
+});
+
+test('Error thrown when requestEagerStart is used with regular Connection', async (t) => {
+  const { taskQueue } = helpers(t);
+
+  const client = new WorkflowClient({ connection: t.context.env.connection });
+
+  await t.throwsAsync(
+    client.start(helloWorkflow, {
+      args: ['Temporal'],
+      workflowId: `eager-workflow-error-${randomUUID()}`,
+      taskQueue,
+      requestEagerStart: true,
+    }),
+    {
+      message: /Eager workflow start requires a NativeConnection/,
+    }
+  );
 });

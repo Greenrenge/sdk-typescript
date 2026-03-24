@@ -22,14 +22,14 @@ import { temporal, grpc as grpcProto } from '@temporalio/proto';
 const workflowServicePackageDefinition = protoLoader.loadSync(
   path.resolve(
     __dirname,
-    '../../core-bridge/sdk-core/sdk-core-protos/protos/api_upstream/temporal/api/workflowservice/v1/service.proto'
+    '../../core-bridge/sdk-core/crates/common/protos/api_upstream/temporal/api/workflowservice/v1/service.proto'
   ),
-  { includeDirs: [path.resolve(__dirname, '../../core-bridge/sdk-core/sdk-core-protos/protos/api_upstream')] }
+  { includeDirs: [path.resolve(__dirname, '../../core-bridge/sdk-core/crates/common/protos/api_upstream')] }
 );
 const workflowServiceProtoDescriptor = grpc.loadPackageDefinition(workflowServicePackageDefinition) as any;
 
 const healthServicePackageDefinition = protoLoader.loadSync(
-  path.resolve(__dirname, '../../core-bridge/sdk-core/sdk-core-protos/protos/grpc/health/v1/health.proto')
+  path.resolve(__dirname, '../../core-bridge/sdk-core/crates/common/protos/grpc/health/v1/health.proto')
 );
 const healthServicePackageDescriptor = grpc.loadPackageDefinition(healthServicePackageDefinition) as any;
 
@@ -60,6 +60,8 @@ async function bindLocalhostTls(server: grpc.Server): Promise<number> {
 
 test('withMetadata / withDeadline / withAbortSignal set the CallContext for RPC call', async (t) => {
   let gotTestHeaders = false;
+  let gotStaticBinValue;
+  let gotOtherBinValue;
   let gotDeadline = false;
   const authTokens: string[] = [];
   const deadline = Date.now() + 10000;
@@ -89,6 +91,8 @@ test('withMetadata / withDeadline / withAbortSignal set the CallContext for RPC 
       ) {
         gotTestHeaders = true;
       }
+      gotStaticBinValue = call.metadata.get('staticKey-bin');
+      gotOtherBinValue = call.metadata.get('otherKey-bin');
       const receivedDeadline = call.getDeadline();
       // For some reason the deadline the server gets is slightly different from the one we send in the client
       if (typeof receivedDeadline === 'number' && receivedDeadline >= deadline && receivedDeadline - deadline < 1000) {
@@ -108,16 +112,19 @@ test('withMetadata / withDeadline / withAbortSignal set the CallContext for RPC 
   const port = await bindLocalhost(server);
   const conn = await Connection.connect({
     address: `127.0.0.1:${port}`,
-    metadata: { staticKey: 'set' },
+    metadata: { staticKey: 'set', 'staticKey-bin': Buffer.from([0x00]) },
     apiKey: 'test-token',
+    tls: false,
   });
   await conn.withMetadata({ test: 'true' }, () =>
-    conn.withMetadata({ otherKey: 'set' }, () =>
+    conn.withMetadata({ otherKey: 'set', 'otherKey-bin': Buffer.from([0x01]) }, () =>
       conn.withDeadline(deadline, () => conn.workflowService.registerNamespace({}))
     )
   );
   t.true(gotTestHeaders);
   t.true(gotDeadline);
+  t.deepEqual(gotStaticBinValue, [Buffer.from([0x00])]);
+  t.deepEqual(gotOtherBinValue, [Buffer.from([0x01])]);
   await conn.withApiKey('tt-2', () => conn.workflowService.startWorkflowExecution({}));
   conn.setApiKey('tt-3');
   await conn.workflowService.startWorkflowExecution({});
@@ -158,6 +165,7 @@ test('apiKey sets temporal-namespace header appropriately', async (t) => {
     address: `127.0.0.1:${port}`,
     metadata: { staticKey: 'set' },
     apiKey: 'test-token',
+    tls: false,
   });
 
   await conn.workflowService.startWorkflowExecution({ namespace: 'test-namespace' });
@@ -604,3 +612,17 @@ async function withHttp2Server(
     });
   });
 }
+
+test('Client Connection: TLS is enabled by default when apiKey is provided and tls is not configured', async (t) => {
+  const conn = Connection.lazy({ apiKey: 'test-api-key' });
+  // When TLS is enabled, credentials should NOT be insecure
+  const isInsecure = conn.options.credentials._isSecure !== undefined && !conn.options.credentials._isSecure();
+  t.false(isInsecure, 'Connection should use secure credentials when apiKey is provided');
+});
+
+test('Client Connection: TLS can be explicitly disabled even when apiKey is provided', async (t) => {
+  const conn = Connection.lazy({ apiKey: 'test-api-key', tls: false });
+  // When TLS is explicitly disabled, credentials should be insecure
+  const isInsecure = conn.options.credentials._isSecure !== undefined && !conn.options.credentials._isSecure();
+  t.true(isInsecure, 'Connection should use insecure credentials when tls: false');
+});

@@ -3,9 +3,8 @@ import http from 'node:http';
 import { inspect } from 'node:util';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-grpc';
 import * as opentelemetry from '@opentelemetry/sdk-node';
-import { SemanticResourceAttributes } from '@opentelemetry/semantic-conventions';
+import { SEMRESATTRS_SERVICE_NAME } from '@opentelemetry/semantic-conventions';
 import arg from 'arg';
-import { Connection } from '@temporalio/client';
 import {
   DefaultLogger,
   LogEntry,
@@ -17,7 +16,6 @@ import {
   makeTelemetryFilterString,
 } from '@temporalio/worker';
 import * as activities from '../activities';
-import { ConnectionInjectorInterceptor } from '../activities/interceptors';
 import { getRequired, WorkerArgSpec, workerArgSpec } from './args';
 
 /**
@@ -35,7 +33,7 @@ async function withOptionalOtel(args: arg.Result<WorkerArgSpec>, fn: () => Promi
   const traceExporter = new OTLPTraceExporter({ url });
   const otel = new opentelemetry.NodeSDK({
     resource: new opentelemetry.resources.Resource({
-      [SemanticResourceAttributes.SERVICE_NAME]: 'load-worker',
+      [SEMRESATTRS_SERVICE_NAME]: 'load-worker',
       taskQueue,
     }),
     traceExporter,
@@ -148,11 +146,6 @@ async function main() {
         }
       : {};
 
-  const clientConnection = await Connection.connect({
-    address: serverAddress,
-    ...tlsConfig,
-  });
-
   const connection = await NativeConnection.connect({
     address: serverAddress,
     ...tlsConfig,
@@ -173,9 +166,6 @@ async function main() {
       workflowThreadPoolSize,
       maxConcurrentActivityTaskPolls,
       maxConcurrentWorkflowTaskPolls,
-      interceptors: {
-        activity: [() => ({ inbound: new ConnectionInjectorInterceptor(clientConnection) })],
-      },
       // Can't reuse the helper because it defines `test` and ava thinks it's an ava test.
       reuseV8Context: ['1', 't', 'true'].includes((process.env.REUSE_V8_CONTEXT ?? 'true').toLowerCase()),
     });

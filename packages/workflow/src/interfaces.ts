@@ -14,6 +14,8 @@ import {
   Priority,
   WorkerDeploymentVersion,
   VersioningBehavior,
+  InitialVersioningBehavior,
+  SuggestContinueAsNewReason,
 } from '@temporalio/common';
 import { SymbolBasedInstanceOfError } from '@temporalio/common/lib/type-helpers';
 import { makeProtoEnumConverters } from '@temporalio/common/lib/internal-workflow/enums-helpers';
@@ -45,7 +47,7 @@ export interface WorkflowInfo {
    * This value may change during the lifetime of an Execution.
    * @deprecated Use {@link typedSearchAttributes} instead.
    */
-  readonly searchAttributes: SearchAttributes; // eslint-disable-line deprecation/deprecation
+  readonly searchAttributes: SearchAttributes; // eslint-disable-line @typescript-eslint/no-deprecated
 
   /**
    * Indexed information attached to the Workflow Execution, exposed through an interface.
@@ -121,6 +123,24 @@ export interface WorkflowInfo {
    * Supported only on Temporal Server 1.20+, always `false` on older servers.
    */
   readonly continueAsNewSuggested: boolean;
+
+  /**
+   * Whether the workflow's Target Worker Deployment Version has changed from its Pinned Version.
+   * When true, the workflow should consider continuing-as-new with
+   * `initialVersioningBehavior: 'AUTO_UPGRADE'` to move to the new version.
+   *
+   * This value changes during the lifetime of an Execution.
+   *
+   * @experimental Upgrade-on-Continue-as-New is experimental and may change.
+   */
+  readonly targetWorkerDeploymentVersionChanged: boolean;
+
+  /**
+   * Reason(s) why continue as new is suggested. Can potentially be multiple reasons.
+   *
+   * @experimental May be removed or changed in the future.
+   */
+  readonly suggestedContinueAsNewReasons?: SuggestContinueAsNewReason[];
 
   /**
    * Task queue this Workflow is executing on
@@ -208,8 +228,6 @@ export interface WorkflowInfo {
    * executing this task for the first time and has a Deployment Version set, then its ID will be
    * used. This value may change over the lifetime of the workflow run, but is deterministic and
    * safe to use for branching.
-   *
-   * @experimental Deployment based versioning is experimental and may change in the future.
    */
   readonly currentDeploymentVersion?: WorkerDeploymentVersion;
 
@@ -235,7 +253,22 @@ export interface UnsafeWorkflowInfo {
    */
   readonly now: () => number;
 
+  /**
+   * Whether the workflow is currently replaying.
+   */
   readonly isReplaying: boolean;
+
+  /**
+   * Whether the workflow is currently replaying history events.
+   *
+   * This is similar to {@link isReplaying}, but returns `false` during query handlers and update
+   * validators, which are live read-only operations that should not be considered as replaying
+   * history events.
+   *
+   * When this property is true, workflow log messages are suppressed and sinks defined with
+   * callDuringReplay=false won't get processed.
+   */
+  readonly isReplayingHistoryEvents: boolean;
 }
 
 /**
@@ -304,7 +337,7 @@ export interface ContinueAsNewOptions {
    * Searchable attributes to attach to next Workflow run
    * @deprecated Use {@link typedSearchAttributes} instead.
    */
-  searchAttributes?: SearchAttributes; // eslint-disable-line deprecation/deprecation
+  searchAttributes?: SearchAttributes; // eslint-disable-line @typescript-eslint/no-deprecated
   /**
    * Specifies additional indexed information to attach to the Workflow Execution. More info:
    * https://docs.temporal.io/docs/typescript/search-attributes
@@ -322,48 +355,80 @@ export interface ContinueAsNewOptions {
    *
    * @default 'COMPATIBLE'
    *
-   * @deprecated In favor of the new Worker Deployment API.
-   * @experimental The Worker Versioning API is still being designed. Major changes are expected.
+   * @deprecated Worker Versioning is now deprecated. Please use the Worker Deployment API instead: https://docs.temporal.io/worker-deployments
    */
-  versioningIntent?: VersioningIntent; // eslint-disable-line deprecation/deprecation
+  versioningIntent?: VersioningIntent; // eslint-disable-line @typescript-eslint/no-deprecated
+  /**
+   * Defines the versioning behavior to be used by the first task of a new workflow run in a continue-as-new chain.
+   *
+   * @experimental Versioning semantics with continue-as-new are experimental and may change in the future.
+   */
+  initialVersioningBehavior?: InitialVersioningBehavior;
 }
 
 /**
- * Specifies:
- * - whether cancellation requests are sent to the Child
- * - whether and when a {@link CanceledFailure} is thrown from {@link executeChild} or
- *   {@link ChildWorkflowHandle.result}
+ * Determines:
+ * - whether cancellation requests should be propagated from the Parent Workflow to the Child, and
+ * - whether and when should the Child's cancellation be reported back to the Parent Workflow
+ *   (i.e. at which moment should the {@link executeChild}'s or {@link ChildWorkflowHandle.result}'s
+ *   promise fail with a `ChildWorkflowFailure`, with `cause` set to a `CancelledFailure`).
  *
- * @default {@link ChildWorkflowCancellationType.WAIT_CANCELLATION_COMPLETED}
+ * Note that this setting only applies to cancellation originating from an external request for the
+ * Parent Workflow itself, or from internal cancellation of the `CancellationScope` in which the
+ * Child Workflow call was made. Eventual Cancellation of a Child Workflow on completion of the
+ * Parent Workflow is controlled by the {@link ParentClosePolicy} setting.
+ *
+ * @default ChildWorkflowCancellationType.WAIT_CANCELLATION_COMPLETED
  */
-export type ChildWorkflowCancellationType =
-  (typeof ChildWorkflowCancellationType)[keyof typeof ChildWorkflowCancellationType];
+// MAINTENANCE: Keep this typedoc in sync with the `ChildWorkflowOptions.cancellationType` field
 export const ChildWorkflowCancellationType = {
   /**
-   * Don't send a cancellation request to the Child.
+   * Do not propagate cancellation requests to the Child, and immediately report cancellation
+   * to the caller.
    */
   ABANDON: 'ABANDON',
 
   /**
-   * Send a cancellation request to the Child. Immediately throw the error.
+   * Propagate cancellation request from the Parent Workflow to the Child, yet _immediately_ report
+   * cancellation to the caller, i.e. without waiting for the server to confirm the cancellation
+   * request.
+   *
+   * Note that this cancellation type provides no guarantee, from the Parent-side, that the
+   * cancellation request will actually be atomically added to the Child workflow's history.
+   * In particular, the Child may complete (either successfully or uncessfully) before the
+   * cancellation is delivered, resulting in a situation where the Parent workflow thinks its child
+   * was cancelled, but the child actually completed successfully.
+   *
+   * To guarantee that the Child will eventually be notified of the cancellation request,
+   * use {@link WAIT_CANCELLATION_REQUESTED}.
    */
   TRY_CANCEL: 'TRY_CANCEL',
 
   /**
-   * Send a cancellation request to the Child. The Child may respect cancellation, in which case an error will be thrown
-   * when cancellation has completed, and {@link isCancellation}(error) will be true. On the other hand, the Child may
-   * ignore the cancellation request, in which case an error might be thrown with a different cause, or the Child may
-   * complete successfully.
+   * Propagate cancellation request from the Parent Workflow to the Child, then wait for the server
+   * to confirm that the Child Workflow cancellation request was recorded in its history.
+   *
+   * This cancellation type guarantees that the Child will eventually be notified of the
+   * cancellation request (that is, unless the Child terminates inbetween due to unexpected causes).
+   */
+  WAIT_CANCELLATION_REQUESTED: 'WAIT_CANCELLATION_REQUESTED',
+
+  /**
+   * Propagate cancellation request from the Parent Workflow to the Child, then wait for completion
+   * of the Child Workflow.
+   *
+   * The Child may respect cancellation, in which case the Parent's `executeChild` or
+   * `ChildWorkflowHandle.result` promise will fail with a `ChildWorkflowFailure`, with `cause`
+   * set to a `CancelledFailure`. On the other hand, the Child may ignore the cancellation request,
+   * in which case the corresponding promise will either resolve with a result (if Child completed
+   * successfully) or reject with a different cause (if Child completed uncessfully).
    *
    * @default
    */
   WAIT_CANCELLATION_COMPLETED: 'WAIT_CANCELLATION_COMPLETED',
-
-  /**
-   * Send a cancellation request to the Child. Throw the error once the Server receives the Child cancellation request.
-   */
-  WAIT_CANCELLATION_REQUESTED: 'WAIT_CANCELLATION_REQUESTED',
 } as const;
+export type ChildWorkflowCancellationType =
+  (typeof ChildWorkflowCancellationType)[keyof typeof ChildWorkflowCancellationType];
 
 // ts-prune-ignore-next
 export const [encodeChildWorkflowCancellationType, decodeChildWorkflowCancellationType] = makeProtoEnumConverters<
@@ -387,7 +452,6 @@ export const [encodeChildWorkflowCancellationType, decodeChildWorkflowCancellati
  *
  * @see {@link https://docs.temporal.io/concepts/what-is-a-parent-close-policy/ | Parent Close Policy}
  */
-export type ParentClosePolicy = (typeof ParentClosePolicy)[keyof typeof ParentClosePolicy];
 export const ParentClosePolicy = {
   /**
    * When the Parent is Closed, the Child is Terminated.
@@ -413,29 +477,30 @@ export const ParentClosePolicy = {
    *
    * @deprecated Either leave property `undefined`, or set an explicit policy instead.
    */
-  PARENT_CLOSE_POLICY_UNSPECIFIED: undefined, // eslint-disable-line deprecation/deprecation
+  PARENT_CLOSE_POLICY_UNSPECIFIED: undefined,
 
   /**
    * When the Parent is Closed, the Child is Terminated.
    *
    * @deprecated Use {@link ParentClosePolicy.TERMINATE} instead.
    */
-  PARENT_CLOSE_POLICY_TERMINATE: 'TERMINATE', // eslint-disable-line deprecation/deprecation
+  PARENT_CLOSE_POLICY_TERMINATE: 'TERMINATE',
 
   /**
    * When the Parent is Closed, nothing is done to the Child.
    *
    * @deprecated Use {@link ParentClosePolicy.ABANDON} instead.
    */
-  PARENT_CLOSE_POLICY_ABANDON: 'ABANDON', // eslint-disable-line deprecation/deprecation
+  PARENT_CLOSE_POLICY_ABANDON: 'ABANDON',
 
   /**
    * When the Parent is Closed, the Child is Cancelled.
    *
    * @deprecated Use {@link ParentClosePolicy.REQUEST_CANCEL} instead.
    */
-  PARENT_CLOSE_POLICY_REQUEST_CANCEL: 'REQUEST_CANCEL', // eslint-disable-line deprecation/deprecation
+  PARENT_CLOSE_POLICY_REQUEST_CANCEL: 'REQUEST_CANCEL',
 } as const;
+export type ParentClosePolicy = (typeof ParentClosePolicy)[keyof typeof ParentClosePolicy];
 
 // ts-prune-ignore-next
 export const [encodeParentClosePolicy, decodeParentClosePolicy] = makeProtoEnumConverters<
@@ -471,19 +536,26 @@ export interface ChildWorkflowOptions extends Omit<CommonWorkflowOptions, 'workf
   taskQueue?: string;
 
   /**
-   * Specifies:
-   * - whether cancellation requests are sent to the Child
-   * - whether and when an error is thrown from {@link executeChild} or
-   *   {@link ChildWorkflowHandle.result}
+   * Determines:
+   * - whether cancellation requests should be propagated from the Parent Workflow to the Child, and
+   * - whether and when should the Child's cancellation be reported back to the Parent Workflow
+   *   (i.e. at which moment should the {@link executeChild}'s or {@link ChildWorkflowHandle.result}'s
+   *   promise fail with a `ChildWorkflowFailure`, with `cause` set to a `CancelledFailure`).
    *
-   * @default {@link ChildWorkflowCancellationType.WAIT_CANCELLATION_COMPLETED}
+   * Note that this setting only applies to cancellation originating from an external request for the
+   * Parent Workflow itself, or from internal cancellation of the `CancellationScope` in which the
+   * Child Workflow call was made. Eventual Cancellation of a Child Workflow on completion of the
+   * Parent Workflow is controlled by the {@link ParentClosePolicy} setting.
+   *
+   * @default ChildWorkflowCancellationType.WAIT_CANCELLATION_COMPLETED
    */
+  // MAINTENANCE: Keep this typedoc in sync with the `ChildWorkflowCancellationType` enum
   cancellationType?: ChildWorkflowCancellationType;
 
   /**
    * Specifies how the Child reacts to the Parent Workflow reaching a Closed state.
    *
-   * @default {@link ParentClosePolicy.PARENT_CLOSE_POLICY_TERMINATE}
+   * @default ParentClosePolicy.PARENT_CLOSE_POLICY_TERMINATE
    */
   parentClosePolicy?: ParentClosePolicy;
 
@@ -493,10 +565,9 @@ export interface ChildWorkflowOptions extends Omit<CommonWorkflowOptions, 'workf
    *
    * @default 'COMPATIBLE'
    *
-   * @deprecated In favor of the new Worker Deployment API.
-   * @experimental The Worker Versioning API is still being designed. Major changes are expected.
+   * @deprecated Worker Versioning is now deprecated. Please use the Worker Deployment API instead: https://docs.temporal.io/worker-deployments
    */
-  versioningIntent?: VersioningIntent; // eslint-disable-line deprecation/deprecation
+  versioningIntent?: VersioningIntent; // eslint-disable-line @typescript-eslint/no-deprecated
 }
 
 export type RequiredChildWorkflowOptions = Required<Pick<ChildWorkflowOptions, 'workflowId' | 'cancellationType'>> & {
@@ -581,6 +652,7 @@ export interface WorkflowCreateOptionsInternal extends WorkflowCreateOptions {
   sourceMap: RawSourceMap;
   registeredActivityNames: Set<string>;
   getTimeOfDay(): bigint;
+  stackTracesEnabled: boolean;
 }
 
 /**

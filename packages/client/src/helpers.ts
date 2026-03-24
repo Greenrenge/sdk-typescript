@@ -43,6 +43,8 @@ function workflowStatusCodeToNameInternal(
       return 'COMPLETED';
     case temporal.api.enums.v1.WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW:
       return 'CONTINUED_AS_NEW';
+    case temporal.api.enums.v1.WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_PAUSED:
+      return 'PAUSED';
   }
 }
 
@@ -52,7 +54,6 @@ export async function executionInfoFromRaw<T>(
   rawDataToEmbed: T
 ): Promise<Replace<WorkflowExecutionInfo, { raw: T }>> {
   return {
-    /* eslint-disable @typescript-eslint/no-non-null-assertion */
     type: raw.type!.name!,
     workflowId: raw.execution!.workflowId!,
     runId: raw.execution!.runId!,

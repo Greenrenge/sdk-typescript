@@ -1,10 +1,10 @@
-/* eslint-disable @typescript-eslint/no-non-null-assertion */
 import { lastValueFrom } from 'rxjs';
 import { SdkComponent, defaultPayloadConverter, fromPayloadsAtIndex } from '@temporalio/common';
 import { msToTs } from '@temporalio/common/lib/time';
 import { coresdk } from '@temporalio/proto';
 import { DefaultLogger, Runtime, ShutdownError } from '@temporalio/worker';
 import { byteArrayToBuffer } from '@temporalio/worker/lib/utils';
+import { native } from '@temporalio/core-bridge';
 import { NativeReplayHandle, NativeWorkerLike, Worker as RealWorker } from '@temporalio/worker/lib/worker';
 import { LoggerWithComposedMetadata } from '@temporalio/common/lib/logger';
 import { MetricMeterWithComposedTags } from '@temporalio/common/lib/metrics';
@@ -94,9 +94,19 @@ export class MockNativeWorker implements NativeWorkerLike {
     this.workflowCompletionCallback = undefined;
   }
 
+  public async pollNexusTask(): Promise<Buffer> {
+    // Not implementing this in the mock worker, testing with real worker instead.
+    throw new Error('not implemented');
+  }
+
   public async completeActivityTask(result: Buffer): Promise<void> {
     this.activityCompletionCallback!(result);
     this.activityCompletionCallback = undefined;
+  }
+
+  public async completeNexusTask(_result: Buffer): Promise<void> {
+    // Not implementing this in the mock worker, testing with real worker instead.
+    throw new Error('not implemented');
   }
 
   public emit(task: Task): void {
@@ -141,6 +151,10 @@ export class MockNativeWorker implements NativeWorkerLike {
     this.activityHeartbeatCallback!(taskToken, arg);
   }
 
+  public replaceClient(_client: native.Client): void {
+    // No-op for mock worker
+  }
+
   public async untilHeartbeat(taskToken: Uint8Array): Promise<any> {
     return new Promise((resolve) => {
       this.activityHeartbeatCallback = (heartbeatTaskToken, details) => {
@@ -166,7 +180,7 @@ export class Worker extends RealWorker {
       taskQueue: opts.taskQueue,
     });
     const nativeWorker = new MockNativeWorker();
-    super(runtime, nativeWorker, workflowCreator, opts, logger, runtime.metricMeter);
+    super(runtime, nativeWorker, workflowCreator, opts, logger, runtime.metricMeter, opts.plugins ?? []);
   }
 
   public runWorkflows(...args: Parameters<Worker['workflow$']>): Promise<void> {

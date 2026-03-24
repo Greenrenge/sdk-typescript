@@ -12,9 +12,9 @@ import { Worker } from './helpers';
 const workflowServicePackageDefinition = protoLoader.loadSync(
   path.resolve(
     __dirname,
-    '../../core-bridge/sdk-core/sdk-core-protos/protos/api_upstream/temporal/api/workflowservice/v1/service.proto'
+    '../../core-bridge/sdk-core/crates/common/protos/api_upstream/temporal/api/workflowservice/v1/service.proto'
   ),
-  { includeDirs: [path.resolve(__dirname, '../../core-bridge/sdk-core/sdk-core-protos/protos/api_upstream')] }
+  { includeDirs: [path.resolve(__dirname, '../../core-bridge/sdk-core/crates/common/protos/api_upstream')] }
 );
 const workflowServiceProtoDescriptor = grpc.loadPackageDefinition(workflowServicePackageDefinition) as any;
 
@@ -26,9 +26,9 @@ test('NativeConnection passes headers provided in options', async (t) => {
   const packageDefinition = protoLoader.loadSync(
     path.resolve(
       __dirname,
-      '../../core-bridge/sdk-core/sdk-core-protos/protos/api_upstream/temporal/api/workflowservice/v1/service.proto'
+      '../../core-bridge/sdk-core/crates/common/protos/api_upstream/temporal/api/workflowservice/v1/service.proto'
     ),
-    { includeDirs: [path.resolve(__dirname, '../../core-bridge/sdk-core/sdk-core-protos/protos/api_upstream')] }
+    { includeDirs: [path.resolve(__dirname, '../../core-bridge/sdk-core/crates/common/protos/api_upstream')] }
   );
   const protoDescriptor = grpc.loadPackageDefinition(packageDefinition) as any;
 
@@ -84,6 +84,7 @@ test('NativeConnection passes headers provided in options', async (t) => {
     address: `127.0.0.1:${port}`,
     metadata: { initial: 'true' },
     apiKey: 'enchi_cat',
+    tls: false,
   });
   t.true(gotInitialHeader);
   t.true(gotApiKey);
@@ -130,6 +131,7 @@ test('apiKey sets temporal-namespace header appropriately', async (t) => {
     address: `127.0.0.1:${port}`,
     metadata: { staticKey: 'set' },
     apiKey: 'test-token',
+    tls: false,
   });
 
   await conn.workflowService.startWorkflowExecution({ namespace: 'test-namespace' });

@@ -1,30 +1,28 @@
 import * as nexus from 'nexus-rpc';
 
+import type { LoadedDataConverter, Payload, MetricMeter, MetricTags } from '@temporalio/common';
 import {
   CancelledFailure,
   IllegalStateError,
-  LoadedDataConverter,
-  Payload,
   SdkComponent,
   LoggerWithComposedMetadata,
-  MetricMeter,
   MetricMeterWithComposedTags,
-  MetricTags,
 } from '@temporalio/common';
-import { temporal, coresdk } from '@temporalio/proto';
+import type { temporal, coresdk } from '@temporalio/proto';
 import { asyncLocalStorage } from '@temporalio/nexus/lib/context';
 import { encodeToPayload } from '@temporalio/common/lib/internal-non-workflow';
 import { isAbortError } from '@temporalio/common/lib/type-helpers';
 import { composeInterceptors } from '@temporalio/common/lib/interceptors';
-import { Client } from '@temporalio/client';
-import { Logger } from '../logger';
-import { NexusInboundCallsInterceptor, NexusInterceptorsFactory, NexusOutboundCallsInterceptor } from '../interceptors';
-import {
-  coerceToHandlerError,
-  decodePayloadIntoLazyValue,
-  handlerErrorToProto,
-  operationErrorToProto,
-} from './conversions';
+import type { Client } from '@temporalio/client';
+import type { Logger } from '../logger';
+import type {
+  NexusCancelOperationInput,
+  NexusStartOperationInput,
+  NexusInboundCallsInterceptor,
+  NexusInterceptorsFactory,
+  NexusOutboundCallsInterceptor,
+} from '../interceptors';
+import { coerceToHandlerError, decodePayload, handlerErrorToProto, operationErrorToProto } from './conversions';
 
 const UNINITIALIZED = Symbol();
 
@@ -54,7 +52,7 @@ export class NexusHandler {
     public readonly context: nexus.OperationContext,
     public readonly client: Client,
     public readonly abortController: AbortController,
-    public readonly serviceRegistry: nexus.ServiceRegistry,
+    private readonly services: Map<string, nexus.ServiceHandler>,
     public readonly dataConverter: LoadedDataConverter,
     workerLogger: Logger,
     workerMetricMeter: MetricMeter,
@@ -96,17 +94,35 @@ export class NexusHandler {
     return composeInterceptors(this.interceptors.outbound, 'getMetricTags', (a) => a)(baseTags);
   }
 
+  private getOperationHandler(ctx: nexus.OperationContext): nexus.OperationHandler<unknown, unknown> {
+    const serviceHandler = this.services.get(ctx.service);
+    if (serviceHandler == null) {
+      throw new nexus.HandlerError('NOT_FOUND', `No service handler registered for service name '${ctx.service}'`);
+    }
+    return serviceHandler.getOperationHandler(ctx.operation);
+  }
+
   protected async startOperation(
     ctx: nexus.StartOperationContext,
     payload: Payload | undefined
   ): Promise<coresdk.nexus.INexusTaskCompletion> {
     try {
-      const input = await decodePayloadIntoLazyValue(this.dataConverter, payload);
+      const handler = this.getOperationHandler(ctx);
+      const input = await decodePayload(this.dataConverter, payload);
 
-      const result = await this.invokeUserCode(
+      const executeNextHandler = async (interceptorInput: NexusStartOperationInput) => {
+        const result = await this.invokeUserCode(
+          'startOperation',
+          handler.start.bind(handler, interceptorInput.ctx, interceptorInput.input)
+        );
+        return { result };
+      };
+      const executeWithInterceptors = composeInterceptors(
+        this.interceptors.inbound,
         'startOperation',
-        this.serviceRegistry.start.bind(this.serviceRegistry, ctx, input)
+        executeNextHandler
       );
+      const { result } = await executeWithInterceptors({ ctx, input });
 
       if (result.isAsync) {
         return {
@@ -139,14 +155,14 @@ export class NexusHandler {
           taskToken: this.taskToken,
           completed: {
             startOperation: {
-              operationError: await operationErrorToProto(this.dataConverter, err),
+              failure: await operationErrorToProto(this.dataConverter, err),
             },
           },
         };
       }
       return {
         taskToken: this.taskToken,
-        error: await handlerErrorToProto(this.dataConverter, coerceToHandlerError(err)),
+        failure: await handlerErrorToProto(this.dataConverter, coerceToHandlerError(err)),
       };
     }
   }
@@ -156,7 +172,19 @@ export class NexusHandler {
     token: string
   ): Promise<coresdk.nexus.INexusTaskCompletion> {
     try {
-      await this.invokeUserCode('cancelOperation', this.serviceRegistry.cancel.bind(this.serviceRegistry, ctx, token));
+      const handler = this.getOperationHandler(ctx);
+      const cancelNextHandler = async (interceptorInput: NexusCancelOperationInput) => {
+        await this.invokeUserCode(
+          'cancelOperation',
+          handler.cancel.bind(handler, interceptorInput.ctx, interceptorInput.token)
+        );
+      };
+      const cancelWithInterceptors = composeInterceptors(
+        this.interceptors.inbound,
+        'cancelOperation',
+        cancelNextHandler
+      );
+      await cancelWithInterceptors({ ctx, token });
       return {
         taskToken: this.taskToken,
         completed: {
@@ -166,7 +194,7 @@ export class NexusHandler {
     } catch (err) {
       return {
         taskToken: this.taskToken,
-        error: await handlerErrorToProto(this.dataConverter, coerceToHandlerError(err)),
+        failure: await handlerErrorToProto(this.dataConverter, coerceToHandlerError(err)),
       };
     }
   }
@@ -204,10 +232,13 @@ export class NexusHandler {
   ): Promise<coresdk.nexus.INexusTaskCompletion> {
     if (task.request?.startOperation != null) {
       const variant = task.request?.startOperation;
+      if (!variant.requestId) {
+        throw new IllegalStateError('Missing requestId in Nexus start operation request');
+      }
       return await this.startOperation(
         {
           ...this.context,
-          requestId: variant.requestId ?? undefined,
+          requestId: variant.requestId,
           inboundLinks: (variant.links ?? []).map(protoLinkToNexusLink),
           callbackUrl: variant.callback ?? undefined,
           callbackHeaders: variant.callbackHeader ?? undefined,
@@ -242,6 +273,7 @@ export class NexusHandler {
           client: this.client,
           namespace: this.namespace,
           taskQueue: this.taskQueue,
+          endpoint: task.request?.endpoint ?? '',
           log: LoggerWithComposedMetadata.compose(this.logger, { sdkComponent: SdkComponent.nexus }),
           metrics: this.metricMeter,
         },
@@ -253,11 +285,13 @@ export class NexusHandler {
 
 export function constructNexusOperationContext(
   request: temporal.api.nexus.v1.IRequest | null | undefined,
-  abortSignal: AbortSignal
+  abortSignal: AbortSignal,
+  requestDeadline?: Date
 ): nexus.OperationContext {
   const base = {
     abortSignal,
     headers: headersProxy(request?.header),
+    requestDeadline,
   };
 
   if (request?.startOperation != null) {

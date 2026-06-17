@@ -3,12 +3,13 @@
  *
  * @module
  */
-import { encodeVersioningBehavior, IllegalStateError, WorkflowFunctionWithOptions } from '@temporalio/common';
-import { composeInterceptors } from '@temporalio/common/lib/interceptors';
-import { coresdk } from '@temporalio/proto';
+import type { WorkflowFunctionWithOptions } from '@temporalio/common';
+import { encodeVersioningBehavior, IllegalStateError } from '@temporalio/common';
+import type { coresdk } from '@temporalio/proto';
 import type { WorkflowInterceptorsFactory } from './interceptors';
 import type { WorkflowCreateOptionsInternal } from './interfaces';
 import { Activator } from './internals';
+import { composeInterceptors } from './interceptor-composition';
 import { setActivator, getActivator, maybeGetActivator } from './global-attributes';
 
 // Export the type for use on the "worker" side
@@ -90,6 +91,8 @@ export function initRuntime(options: WorkflowCreateOptionsInternal): void {
     if (isWorkflowFunctionWithOptions(activator.workflow)) {
       if (typeof activator.workflow.workflowDefinitionOptions === 'object') {
         activator.versioningBehavior = activator.workflow.workflowDefinitionOptions.versioningBehavior;
+        activator.workflowDefinitionFailureExceptionTypes =
+          activator.workflow.workflowDefinitionOptions.failureExceptionTypes;
       } else {
         activator.workflowDefinitionOptionsGetter = activator.workflow.workflowDefinitionOptions;
       }

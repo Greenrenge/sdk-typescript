@@ -1,12 +1,15 @@
-import anyTest, { ExecutionContext, TestFn } from 'ava';
+import { randomUUID } from 'crypto';
+import type { ExecutionContext, TestFn } from 'ava';
+import anyTest from 'ava';
 import dedent from 'dedent';
-import { v4 as uuid4 } from 'uuid';
+import { activityInfo } from '@temporalio/activity';
 import { TemporalFailure, defaultPayloadConverter, toPayloads, ApplicationFailure } from '@temporalio/common';
 import { coresdk, google } from '@temporalio/proto';
 import { msToTs } from '@temporalio/common/lib/time';
 import { httpGet } from './activities';
 import { cleanOptionalStackTrace, isBun } from './helpers';
-import { defaultOptions, isolateFreeWorker, Worker } from './mock-native-worker';
+import type { Worker } from './mock-native-worker';
+import { defaultOptions, isolateFreeWorker } from './mock-native-worker';
 import { withZeroesHTTPServer } from './zeroes-http-server';
 import Duration = google.protobuf.Duration;
 
@@ -53,7 +56,7 @@ function compareCompletion(
 test('Worker runs an activity and reports completion', async (t) => {
   const { worker } = t.context;
   await runWorker(t, async () => {
-    const taskToken = Buffer.from(uuid4());
+    const taskToken = Buffer.from(randomUUID());
     const url = 'https://temporal.io';
     const completion = await worker.native.runActivityTask({
       taskToken,
@@ -69,10 +72,54 @@ test('Worker runs an activity and reports completion', async (t) => {
   });
 });
 
+test('Worker activity info does not confuse task queue and namespace', async (t) => {
+  const worker = isolateFreeWorker({
+    ...defaultOptions,
+    namespace: 'activity-namespace',
+    taskQueue: 'activity-task-queue',
+    activities: {
+      async getActivityInfo() {
+        const info = activityInfo();
+        return {
+          taskQueue: info.taskQueue,
+          namespace: info.namespace,
+          // eslint-disable-next-line @typescript-eslint/no-deprecated
+          activityNamespace: info.activityNamespace,
+          // eslint-disable-next-line @typescript-eslint/no-deprecated
+          workflowNamespace: info.workflowNamespace,
+        };
+      },
+    },
+  });
+  t.context.worker = worker;
+
+  await runWorker(t, async () => {
+    const taskToken = Buffer.from(randomUUID());
+    const completion = await worker.native.runActivityTask({
+      taskToken,
+      start: {
+        activityType: 'getActivityInfo',
+        workflowNamespace: 'workflow-namespace',
+        workflowExecution: { workflowId: 'wfid', runId: 'runId' },
+      },
+    });
+    compareCompletion(t, completion.result, {
+      completed: {
+        result: defaultPayloadConverter.toPayload({
+          taskQueue: 'activity-task-queue',
+          namespace: 'workflow-namespace',
+          activityNamespace: 'activity-namespace',
+          workflowNamespace: 'workflow-namespace',
+        }),
+      },
+    });
+  });
+});
+
 test('Worker runs an activity and reports failure', async (t) => {
   const { worker } = t.context;
   await runWorker(t, async () => {
-    const taskToken = Buffer.from(uuid4());
+    const taskToken = Buffer.from(randomUUID());
     const message = ':(';
     const completion = await worker.native.runActivityTask({
       taskToken,
@@ -105,7 +152,7 @@ test('Worker runs an activity and reports failure', async (t) => {
 const workerCancelsActivityMacro = test.macro(async (t, throwIfAborted?: boolean) => {
   const { worker } = t.context;
   await runWorker(t, async () => {
-    const taskToken = Buffer.from(uuid4());
+    const taskToken = Buffer.from(randomUUID());
     worker.native.emit({
       activity: {
         taskToken,
@@ -142,7 +189,7 @@ test('Activity Context AbortSignal cancels a fetch request', async (t) => {
   const { worker } = t.context;
   await runWorker(t, async () => {
     await withZeroesHTTPServer(async (port) => {
-      const taskToken = Buffer.from(uuid4());
+      const taskToken = Buffer.from(randomUUID());
       worker.native.emit({
         activity: {
           taskToken,
@@ -170,7 +217,7 @@ test('Activity cancel with reason "NOT_FOUND" is valid', async (t) => {
   const { worker } = t.context;
   await runWorker(t, async () => {
     await withZeroesHTTPServer(async (port) => {
-      const taskToken = Buffer.from(uuid4());
+      const taskToken = Buffer.from(randomUUID());
       worker.native.emit({
         activity: {
           taskToken,
@@ -197,7 +244,7 @@ test('Activity cancel with reason "NOT_FOUND" is valid', async (t) => {
 test('Activity Context heartbeat is sent to core', async (t) => {
   const { worker } = t.context;
   await runWorker(t, async () => {
-    const taskToken = Buffer.from(uuid4());
+    const taskToken = Buffer.from(randomUUID());
     const completionPromise = worker.native.runActivityTask({
       taskToken,
       start: {
@@ -221,7 +268,7 @@ test('Activity Context heartbeat is sent to core', async (t) => {
 test('Worker fails activity with proper message when it is not registered', async (t) => {
   const { worker } = t.context;
   await runWorker(t, async () => {
-    const taskToken = Buffer.from(uuid4());
+    const taskToken = Buffer.from(randomUUID());
     const { result } = await worker.native.runActivityTask({
       taskToken,
       start: {
@@ -247,7 +294,7 @@ test('Worker fails activity with proper message if activity info contains null S
   t.context.worker = worker;
 
   await runWorker(t, async () => {
-    const taskToken = Buffer.from(uuid4());
+    const taskToken = Buffer.from(randomUUID());
     const { result } = await worker.native.runActivityTask({
       taskToken,
       start: {
@@ -281,7 +328,7 @@ test('Worker fails activity task if interceptor factory throws', async (t) => {
   t.context.worker = worker;
 
   await runWorker(t, async () => {
-    const taskToken = Buffer.from(uuid4());
+    const taskToken = Buffer.from(randomUUID());
     const { result } = await worker.native.runActivityTask({
       taskToken,
       start: {
@@ -309,7 +356,7 @@ test('Non ApplicationFailure TemporalFailures thrown from Activity are wrapped w
   t.context.worker = worker;
 
   await runWorker(t, async () => {
-    const taskToken = Buffer.from(uuid4());
+    const taskToken = Buffer.from(randomUUID());
     const { result } = await worker.native.runActivityTask({
       taskToken,
       start: {
@@ -337,7 +384,7 @@ test('nextRetryDelay in activity failures is propagated to Core', async (t) => {
   t.context.worker = worker;
 
   await runWorker(t, async () => {
-    const taskToken = Buffer.from(uuid4());
+    const taskToken = Buffer.from(randomUUID());
     const { result } = await worker.native.runActivityTask({
       taskToken,
       start: {

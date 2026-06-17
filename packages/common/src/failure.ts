@@ -1,6 +1,6 @@
 import type { temporal } from '@temporalio/proto';
 import { errorMessage, isRecord, SymbolBasedInstanceOfError } from './type-helpers';
-import { Duration } from './time';
+import type { Duration } from './time';
 import { makeProtoEnumConverters } from './internal-workflow';
 
 export const FAILURE_SOURCE = 'TypeScriptSDK';
@@ -104,7 +104,7 @@ export const [encodeRetryState, decodeRetryState] = makeProtoEnumConverters<
 /**
  * A category to describe the severity and change the observability behavior of an application failure.
  *
- * Currently, observability behaviour changes are limited to:
+ * Currently, observability behavior changes are limited to:
  * - activities that fail due to a BENIGN application failure emit DEBUG level logs and do not record metrics
  *
  * @experimental Category is a new feature and may be subject to change.
@@ -184,7 +184,7 @@ export class ServerFailure extends TemporalFailure {
  * - `details` are set to null
  * - stack trace is copied from the original error
  *
- * When an {@link https://docs.temporal.io/concepts/what-is-an-activity-execution | Activity Execution} fails, the
+ * When an {@link https://docs.temporal.io/activity-execution#activity-execution | Activity Execution} fails, the
  * `ApplicationFailure` from the last Activity Task will be the `cause` of the {@link ActivityFailure} thrown in the
  * Workflow.
  */

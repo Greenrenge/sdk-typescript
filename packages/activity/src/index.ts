@@ -11,7 +11,7 @@
  * ```
  *
  * Any function can be used as an Activity as long as its parameters and return value are serializable using a
- * {@link https://docs.temporal.io/concepts/what-is-a-data-converter/ | DataConverter}.
+ * {@link https://docs.temporal.io/default-custom-data-converters#custom-data-converter | DataConverter}.
  *
  * ### Cancellation
  *
@@ -55,22 +55,68 @@
  *
  * #### An Activity that sends progress heartbeats and can be Cancelled
  *
- * <!--SNIPSTART typescript-activity-fake-progress-->
- * <!--SNIPEND-->
+ * ```ts
+ * import { activityInfo, log, sleep, CancelledFailure, heartbeat } from '@temporalio/activity';
+ *
+ * export async function fakeProgress(sleepIntervalMs = 1000): Promise<void> {
+ *   try {
+ *     // allow for resuming from heartbeat
+ *     const startingPoint = activityInfo().heartbeatDetails || 1;
+ *     log.info('Starting activity at progress', { startingPoint });
+ *     for (let progress = startingPoint; progress <= 100; ++progress) {
+ *       // simple utility to sleep in activity for given interval or throw if Activity is cancelled
+ *       // don't confuse with Workflow.sleep which is only used in Workflow functions!
+ *       log.info('Progress', { progress });
+ *       await sleep(sleepIntervalMs);
+ *       heartbeat(progress);
+ *     }
+ *   } catch (err) {
+ *     if (err instanceof CancelledFailure) {
+ *       log.warn('Fake progress activity cancelled', { message: err.message });
+ *       // Cleanup
+ *     }
+ *     throw err;
+ *   }
+ * }
+ * ```
  *
  * #### An Activity that makes a cancellable HTTP request
  *
  * It passes the `AbortSignal` to {@link https://github.com/node-fetch/node-fetch#api | `fetch`}: `fetch(url, { signal:
  * Context.current().cancellationSignal })`.
  *
- * <!--SNIPSTART typescript-activity-cancellable-fetch-->
- * <!--SNIPEND-->
+ * ```ts
+ * import fetch from 'node-fetch';
+ * import { cancellationSignal, heartbeat } from '@temporalio/activity';
+ * import type { AbortSignal as FetchAbortSignal } from 'node-fetch/externals';
+ *
+ * export async function cancellableFetch(url: string): Promise<Uint8Array> {
+ *   const response = await fetch(url, { signal: cancellationSignal() as FetchAbortSignal });
+ *   const contentLengthHeader = response.headers.get('Content-Length');
+ *   if (contentLengthHeader === null) {
+ *     throw new Error('expected Content-Length header to be set');
+ *   }
+ *   const contentLength = parseInt(contentLengthHeader);
+ *   let bytesRead = 0;
+ *   const chunks: Buffer[] = [];
+ *
+ *   for await (const chunk of response.body) {
+ *     if (!(chunk instanceof Buffer)) {
+ *       throw new TypeError('Expected Buffer');
+ *     }
+ *     bytesRead += chunk.length;
+ *     chunks.push(chunk);
+ *     heartbeat(bytesRead / contentLength);
+ *   }
+ *   return Buffer.concat(chunks);
+ * }
+ * ```
  *
  * @module
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
-import {
+import type {
   Logger,
   Duration,
   LogLevel,
@@ -78,41 +124,22 @@ import {
   MetricMeter,
   Priority,
   ActivityCancellationDetails,
-  IllegalStateError,
   RetryPolicy,
 } from '@temporalio/common';
+import { IllegalStateError } from '@temporalio/common';
 import { msToNumber } from '@temporalio/common/lib/time';
-import { SymbolBasedInstanceOfError } from '@temporalio/common/lib/type-helpers';
-import { ActivityCancellationDetailsHolder } from '@temporalio/common/lib/activity-cancellation-details';
-import { Client } from '@temporalio/client';
+
+import type { ActivityCancellationDetailsHolder } from '@temporalio/common/lib/activity-cancellation-details';
+import type { Client } from '@temporalio/client';
 
 export {
   ActivityFunction,
   ActivityInterface, // eslint-disable-line @typescript-eslint/no-deprecated
   ApplicationFailure,
   CancelledFailure,
+  CompleteAsyncError,
   UntypedActivities,
 } from '@temporalio/common';
-
-/**
- * Throw this error from an Activity in order to make the Worker forget about this Activity.
- *
- * The Activity can then be completed asynchronously (from anywhere—usually outside the Worker) using
- * {@link Client.activity}.
- *
- * @example
- *
- * ```ts
- *import { CompleteAsyncError } from '@temporalio/activity';
- *
- *export async function myActivity(): Promise<never> {
- *  // ...
- *  throw new CompleteAsyncError();
- *}
- * ```
- */
-@SymbolBasedInstanceOfError('CompleteAsyncError')
-export class CompleteAsyncError extends Error {}
 
 // Make it safe to use @temporalio/activity with multiple versions installed.
 const asyncLocalStorageSymbol = Symbol.for('__temporal_activity_context_storage__');
@@ -126,11 +153,17 @@ export const asyncLocalStorage: AsyncLocalStorage<Context> = (globalThis as any)
  * Holds information about the current Activity Execution. Retrieved inside an Activity with `Context.current().info`.
  */
 export interface Info {
+  /**
+   * Task token associated with this activity execution. Can be used for asynchronous completion
+   */
   readonly taskToken: Uint8Array;
   /**
-   * Base64 encoded `taskToken`
+   * Base64 encoded {@link taskToken}
    */
   readonly base64TaskToken: string;
+  /**
+   * ID of this activity
+   */
   readonly activityId: string;
   /**
    * Exposed Activity function name
@@ -138,6 +171,8 @@ export interface Info {
   readonly activityType: string;
   /**
    * The namespace this Activity is running in
+   *
+   * @deprecated Use {@link namespace} instead
    */
   readonly activityNamespace: string;
   /**
@@ -149,20 +184,22 @@ export interface Info {
    */
   readonly isLocal: boolean;
   /**
-   * Information about the Workflow that scheduled the Activity
+   * Information about the Workflow that scheduled the Activity. Not set if the activity was not started by a Workflow
    */
-  readonly workflowExecution: {
+  readonly workflowExecution?: {
     readonly workflowId: string;
     readonly runId: string;
   };
   /**
-   * The namespace of the Workflow that scheduled this Activity
+   * The namespace of the Workflow that scheduled this Activity. Not set if the activity was not started by a Workflow
+   *
+   * @deprecated Use {@link namespace} instead
    */
-  readonly workflowNamespace: string;
+  readonly workflowNamespace?: string;
   /**
-   * The module name of the Workflow that scheduled this Activity
+   * The module name of the Workflow that scheduled this Activity. Not set if the activity was not started by a Workflow
    */
-  readonly workflowType: string;
+  readonly workflowType?: string;
   /**
    * Timestamp for when this Activity was first scheduled.
    * For retries, this will have the timestamp of the first attempt.
@@ -222,13 +259,31 @@ export interface Info {
    * version), but it may still be defined server-side.
    */
   readonly retryPolicy?: RetryPolicy;
+  /**
+   * The namespace this Activity is running in
+   */
+  readonly namespace: string;
+  /**
+   * ID of the current run of this activity. Can be used to differentiate between different activity executions that
+   * share the same ID. Activities started by a Workflow don't have activity run ID - instead, they can be identified by
+   * workflow ID and workflow run ID; see {@link workflowExecution}
+   *
+   * @experimental Standalone Activities are experimental. APIs may be subject to change.
+   */
+  readonly activityRunId?: string;
+  /**
+   * Whether this activity was started by a workflow
+   *
+   * @experimental Standalone Activities are experimental. APIs may be subject to change.
+   */
+  readonly inWorkflow: boolean;
 }
 
 /**
  * Activity Context, used to:
  *
  * - Get {@link Info} about the current Activity Execution
- * - Send {@link https://docs.temporal.io/concepts/what-is-an-activity-heartbeat | heartbeats}
+ * - Send {@link https://docs.temporal.io/encyclopedia/detecting-activity-failures#activity-heartbeat | heartbeats}
  * - Get notified of Activity cancellation
  * - Sleep (cancellation-aware)
  *
@@ -327,7 +382,7 @@ export class Context {
   ) {}
 
   /**
-   * Send a {@link https://docs.temporal.io/concepts/what-is-an-activity-heartbeat | heartbeat} from an Activity.
+   * Send a {@link https://docs.temporal.io/encyclopedia/detecting-activity-failures#activity-heartbeat | heartbeat} from an Activity.
    *
    * If an Activity times out, then during the next retry, the last value of `details` is available at
    * {@link Info.heartbeatDetails}. This acts as a periodic checkpoint mechanism for the progress of an Activity.
@@ -443,7 +498,7 @@ export function sleep(ms: Duration): Promise<void> {
 }
 
 /**
- * Send a {@link https://docs.temporal.io/concepts/what-is-an-activity-heartbeat | heartbeat} from an Activity.
+ * Send a {@link https://docs.temporal.io/encyclopedia/detecting-activity-failures#activity-heartbeat | heartbeat} from an Activity.
  *
  * If an Activity times out, then during the next retry, the last value of `details` is available at
  * {@link Info.heartbeatDetails}. This acts as a periodic checkpoint mechanism for the progress of an Activity.

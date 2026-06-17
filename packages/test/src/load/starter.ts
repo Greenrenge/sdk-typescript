@@ -1,19 +1,21 @@
 import os from 'node:os';
 import fs, { readFileSync } from 'node:fs';
+import { randomUUID } from 'crypto';
 import arg from 'arg';
 import pidusage from 'pidusage';
 import * as grpc from '@grpc/grpc-js';
-import { v4 as uuid4 } from 'uuid';
-import { interval, range, Observable, OperatorFunction, ReplaySubject, pipe, lastValueFrom } from 'rxjs';
+import type { Observable, OperatorFunction } from 'rxjs';
+import { interval, range, ReplaySubject, pipe, lastValueFrom } from 'rxjs';
 import { bufferTime, map, mergeMap, tap, takeUntil } from 'rxjs/operators';
 import { Connection, ServiceError, WorkflowClient, isGrpcServiceError } from '@temporalio/client';
 import { toMB } from '@temporalio/worker/lib/utils';
-import { StarterArgSpec, starterArgSpec, getRequired } from './args';
+import type { StarterArgSpec } from './args';
+import { starterArgSpec, getRequired } from './args';
 
 const ACCEPTABLE_QUERY_ERROR_CODES = [grpc.status.NOT_FOUND, grpc.status.DEADLINE_EXCEEDED];
 
 async function runWorkflow({ client, workflowName, taskQueue, queryingOptions }: RunWorkflowOptions) {
-  const handle = await client.start(workflowName, { args: [], taskQueue, workflowId: uuid4() });
+  const handle = await client.start(workflowName, { args: [], taskQueue, workflowId: randomUUID() });
 
   let wfRunning = true;
   const wfDoneProm = handle.result().finally(() => (wfRunning = false));

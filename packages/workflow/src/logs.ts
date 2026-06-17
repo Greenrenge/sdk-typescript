@@ -1,9 +1,10 @@
-import { composeInterceptors } from '@temporalio/common/lib/interceptors';
 import { SdkComponent } from '@temporalio/common';
+import { composeInterceptors } from './interceptor-composition';
 import { untrackPromise } from './stack-helpers';
 import { type Sink, type Sinks, proxySinks } from './sinks';
 import { isCancellation } from './errors';
-import { WorkflowInfo, ContinueAsNew } from './interfaces';
+import type { WorkflowInfo } from './interfaces';
+import { ContinueAsNew } from './interfaces';
 import { assertInWorkflowContext } from './global-attributes';
 import { currentUpdateInfo, inWorkflowContext } from './workflow';
 

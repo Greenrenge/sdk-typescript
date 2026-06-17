@@ -4,11 +4,13 @@ import { msToTs } from '@temporalio/common/lib/time';
 import { coresdk } from '@temporalio/proto';
 import { DefaultLogger, Runtime, ShutdownError } from '@temporalio/worker';
 import { byteArrayToBuffer } from '@temporalio/worker/lib/utils';
-import { native } from '@temporalio/core-bridge';
-import { NativeReplayHandle, NativeWorkerLike, Worker as RealWorker } from '@temporalio/worker/lib/worker';
+import type { native } from '@temporalio/core-bridge';
+import type { NativeReplayHandle, NativeWorkerLike } from '@temporalio/worker/lib/worker';
+import { Worker as RealWorker } from '@temporalio/worker/lib/worker';
 import { LoggerWithComposedMetadata } from '@temporalio/common/lib/logger';
 import { MetricMeterWithComposedTags } from '@temporalio/common/lib/metrics';
-import { CompiledWorkerOptions, compileWorkerOptions, WorkerOptions } from '@temporalio/worker/lib/worker-options';
+import type { CompiledWorkerOptions, WorkerOptions } from '@temporalio/worker/lib/worker-options';
+import { compileWorkerOptions } from '@temporalio/worker/lib/worker-options';
 import type { WorkflowCreator } from '@temporalio/worker/lib/workflow/interface';
 import * as activities from './activities';
 
@@ -61,7 +63,7 @@ export class MockNativeWorker implements NativeWorkerLike {
   }
 
   public initiateShutdown(): void {
-    const shutdownErrorPromise = Promise.reject(new ShutdownError('Core is shut down'));
+    const shutdownErrorPromise = Promise.reject(new ShutdownError('Core is shut down')); // eslint-disable-line @typescript-eslint/no-deprecated
     shutdownErrorPromise.catch(() => {
       /* avoid unhandled rejection */
     });

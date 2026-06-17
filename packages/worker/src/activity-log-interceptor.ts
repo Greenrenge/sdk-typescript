@@ -1,7 +1,7 @@
-import { Context } from '@temporalio/activity';
+import type { Context } from '@temporalio/activity';
 import { SdkComponent } from '@temporalio/common';
-import { ActivityInboundCallsInterceptor, ActivityExecuteInput, Next } from './interceptors';
-import { Logger } from './logger';
+import type { ActivityInboundCallsInterceptor, ActivityExecuteInput, Next } from './interceptors';
+import type { Logger } from './logger';
 import { activityLogAttributes } from './activity';
 import { Runtime } from './runtime';
 
@@ -29,10 +29,7 @@ export class ActivityInboundLogInterceptor implements ActivityInboundCallsInterc
     // extending it (ie. to inject custom log attributes), then just be a noop. This is just to avoid bothering users
     // that followed something that used to be a recommended pattern. The "default" behavior that used to be provided by
     // this class is now handled elsewhere.
-    if (
-      this.logger === runtimeLogger &&
-      Object.getPrototypeOf(this) === ActivityInboundLogInterceptor.prototype // eslint-disable-line @typescript-eslint/no-deprecated
-    )
+    if (this.logger === runtimeLogger && Object.getPrototypeOf(this) === ActivityInboundLogInterceptor.prototype)
       return;
 
     this.ctx.log = Object.fromEntries(

@@ -1,6 +1,8 @@
-import anyTest, { TestFn } from 'ava';
-import { temporal } from '@temporalio/proto';
-import { bundleWorkflowCode, ReplayError, WorkflowBundle } from '@temporalio/worker';
+import type { TestFn } from 'ava';
+import anyTest from 'ava';
+import type { temporal } from '@temporalio/proto';
+import type { WorkflowBundle } from '@temporalio/worker';
+import { bundleWorkflowCode, ReplayError } from '@temporalio/worker';
 import { DeterminismViolationError } from '@temporalio/workflow';
 import { loadHistory, Worker } from './helpers';
 
@@ -56,6 +58,28 @@ test('cancel-fake-progress-replay from JSON', async (t) => {
     hist
   );
   t.pass();
+});
+
+test('runReplayHistory closes replay iterator after first result', async (t) => {
+  const hist = { events: [{ eventId: 1 }] };
+  let iteratorClosed = false;
+
+  class TestWorker extends Worker {
+    public static override async *runReplayHistories(): AsyncIterableIterator<{
+      workflowId: string;
+      runId: string;
+    }> {
+      try {
+        yield { workflowId: 'fake', runId: 'run' };
+      } finally {
+        iteratorClosed = true;
+      }
+    }
+  }
+
+  await TestWorker.runReplayHistory({ workflowBundle: t.context.bundle }, hist);
+
+  t.true(iteratorClosed);
 });
 
 test('cancel-fake-progress-replay-nondeterministic', async (t) => {

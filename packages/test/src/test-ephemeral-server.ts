@@ -1,13 +1,15 @@
 import fs from 'fs/promises';
-import anyTest, { ExecutionContext, TestFn } from 'ava';
-import { v4 as uuid4 } from 'uuid';
-import { bundleWorkflowCode, WorkflowBundle } from '@temporalio/worker';
+import { randomUUID } from 'crypto';
+import type { ExecutionContext, TestFn } from 'ava';
+import anyTest from 'ava';
+import type { WorkflowBundle } from '@temporalio/worker';
+import { bundleWorkflowCode } from '@temporalio/worker';
 import { Connection } from '@temporalio/client';
 import { TestWorkflowEnvironment as RealTestWorkflowEnvironment } from '@temporalio/testing';
 import {
   Worker,
   TestWorkflowEnvironment,
-  testTimeSkipping as anyTestTimeSkipping,
+  testTimeSkipping as testTimeSkippingFromHelpers,
   getRandomPort,
   isBun,
 } from './helpers';
@@ -18,7 +20,7 @@ interface Context {
 }
 
 const test = anyTest as TestFn<Context>;
-const testTimeSkipping = anyTestTimeSkipping as TestFn<Context>;
+const testTimeSkipping = testTimeSkippingFromHelpers as TestFn<Context>;
 
 test.before(async (t) => {
   t.context.bundle = await bundleWorkflowCode({ workflowsPath: require.resolve('./workflows') });
@@ -40,7 +42,7 @@ async function runSimpleWorkflow(t: ExecutionContext<Context>, testEnv: TestWork
     });
     await worker.runUntil(
       client.workflow.execute('successString', {
-        workflowId: uuid4(),
+        workflowId: randomUUID(),
         taskQueue,
       })
     );
@@ -72,7 +74,7 @@ test.todo('TestEnvironment sets up dev server with custom log level');
 test.todo('TestEnvironment sets up dev server with custom namespace, IP and UI');
 
 test('TestEnvironment sets up dev server with db filename', async (t) => {
-  const dbFilename = `temporal-db-${uuid4()}.sqlite`;
+  const dbFilename = `temporal-db-${randomUUID()}.sqlite`;
   try {
     const testEnv = await TestWorkflowEnvironment.createLocal({
       server: {

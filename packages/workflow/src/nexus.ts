@@ -1,20 +1,20 @@
-import * as nexus from 'nexus-rpc';
+import type * as nexus from 'nexus-rpc';
 import { msOptionalToTs } from '@temporalio/common/lib/time';
 import { userMetadataToPayload } from '@temporalio/common/lib/user-metadata';
-import { composeInterceptors } from '@temporalio/common/lib/interceptors';
 import { makeProtoEnumConverters } from '@temporalio/common/lib/internal-workflow/enums-helpers';
 import type { coresdk } from '@temporalio/proto';
 import { CancellationScope } from './cancellation-scope';
 import { getActivator } from './global-attributes';
+import { composeInterceptors } from './interceptor-composition';
 import { untrackPromise } from './stack-helpers';
-import { StartNexusOperationInput, StartNexusOperationOutput, StartNexusOperationOptions } from './interceptors';
+import type { StartNexusOperationInput, StartNexusOperationOutput, StartNexusOperationOptions } from './interceptors';
 
 /**
  * A Nexus client for invoking Nexus Operations for a specific service from a Workflow.
  *
  * @experimental Nexus support in Temporal SDK is experimental.
  */
-export interface NexusClient<T extends nexus.ServiceDefinition> {
+export interface NexusServiceClient<T extends nexus.ServiceDefinition> {
   /**
    * Start a Nexus Operation and wait for its completion taking a {@link nexus.operation}.
    * Returns the operation's result.
@@ -104,9 +104,9 @@ export interface NexusOperationHandle<T> {
 }
 
 /**
- * Options for {@link createNexusClient}.
+ * Options for {@link createNexusServiceClient}.
  */
-export interface NexusClientOptions<T> {
+export interface NexusServiceClientOptions<T> {
   endpoint: string;
   service: T;
 }
@@ -116,8 +116,10 @@ export interface NexusClientOptions<T> {
  *
  * @experimental Nexus support in Temporal SDK is experimental.
  */
-export function createNexusClient<T extends nexus.ServiceDefinition>(options: NexusClientOptions<T>): NexusClient<T> {
-  class NexusClientImpl<T extends nexus.ServiceDefinition> implements NexusClient<T> {
+export function createNexusServiceClient<T extends nexus.ServiceDefinition>(
+  options: NexusServiceClientOptions<T>
+): NexusServiceClient<T> {
+  class NexusServiceClientImpl<T extends nexus.ServiceDefinition> implements NexusServiceClient<T> {
     async executeOperation<O extends T['operations'][keyof T['operations']]>(
       operation: string | T['operations'][nexus.OperationKey<T['operations']>],
       input: nexus.OperationInput<T['operations'][nexus.OperationKey<T['operations']>]>,
@@ -176,7 +178,7 @@ export function createNexusClient<T extends nexus.ServiceDefinition>(options: Ne
     }
   }
 
-  return new NexusClientImpl<T>();
+  return new NexusServiceClientImpl<T>();
 }
 
 function startNexusOperationNextHandler({
@@ -189,6 +191,11 @@ function startNexusOperationNextHandler({
   headers,
 }: StartNexusOperationInput): Promise<StartNexusOperationOutput> {
   const activator = getActivator();
+  const context = {
+    type: 'workflow' as const,
+    namespace: activator.info.namespace,
+    workflowId: activator.info.workflowId,
+  };
 
   return new Promise<StartNexusOperationOutput>((resolve, reject) => {
     const scope = CancellationScope.current();
@@ -221,13 +228,13 @@ function startNexusOperationNextHandler({
         service,
         operation,
         nexusHeader: headers,
-        input: activator.payloadConverter.toPayload(input),
+        input: activator.payloadConverter.toPayload(input, context),
         scheduleToCloseTimeout: msOptionalToTs(options?.scheduleToCloseTimeout),
         scheduleToStartTimeout: msOptionalToTs(options?.scheduleToStartTimeout),
         startToCloseTimeout: msOptionalToTs(options?.startToCloseTimeout),
         cancellationType: encodeNexusOperationCancellationType(options?.cancellationType),
       },
-      userMetadata: userMetadataToPayload(activator.payloadConverter, options?.summary, undefined),
+      userMetadata: userMetadataToPayload(activator.payloadConverter, options?.summary, undefined, context),
     });
 
     activator.completions.nexusOperationStart.set(seq, {

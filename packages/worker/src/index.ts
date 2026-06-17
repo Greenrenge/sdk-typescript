@@ -3,13 +3,39 @@
  *
  * ### Usage
  *
- * <!--SNIPSTART typescript-hello-worker-->
- * <!--SNIPEND-->
+ * ```ts
+ * import { NativeConnection, Worker } from '@temporalio/worker';
+ * import * as activities from './activities';
+ *
+ * async function run() {
+ *   const connection = await NativeConnection.connect({
+ *     address: 'localhost:7233',
+ *   });
+ *   try {
+ *     const worker = await Worker.create({
+ *       connection,
+ *       namespace: 'default',
+ *       taskQueue: 'sleep-for-days',
+ *       workflowsPath: require.resolve('./workflows'),
+ *       activities,
+ *     });
+ *     await worker.run();
+ *   } finally {
+ *     // Close the connection once the worker has stopped
+ *     await connection.close();
+ *   }
+ * }
+ *
+ * run().catch((err) => {
+ *   console.error(err);
+ *   process.exit(1);
+ * });
+ * ```
  * @module
  */
 
 export { NativeConnection, NativeConnectionPlugin } from './connection';
-export { NativeConnectionOptions, TLSConfig } from './connection-options';
+export { DNSLoadBalancingConfig, NativeConnectionOptions, TLSConfig } from './connection-options';
 export { startDebugReplayer } from './debug-replayer';
 export { IllegalStateError } from '@temporalio/common';
 export {

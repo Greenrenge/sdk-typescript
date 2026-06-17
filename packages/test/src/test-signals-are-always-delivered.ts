@@ -6,10 +6,11 @@
  *
  * @module
  */
+import { randomUUID } from 'crypto';
 import test from 'ava';
-import { v4 as uuid4 } from 'uuid';
 import { WorkflowClient } from '@temporalio/client';
-import { DefaultLogger, Runtime, InjectedSinks } from '@temporalio/worker';
+import type { InjectedSinks } from '@temporalio/worker';
+import { DefaultLogger, Runtime } from '@temporalio/worker';
 import { defaultOptions } from './mock-native-worker';
 import { RUN_INTEGRATION_TESTS, Worker } from './helpers';
 import * as workflows from './workflows';
@@ -22,7 +23,7 @@ if (RUN_INTEGRATION_TESTS) {
   test('Signals are always delivered', async (t) => {
     const taskQueue = 'test-signal-delivery';
     const conn = new WorkflowClient();
-    const wf = await conn.start(workflows.signalsAreAlwaysProcessed, { taskQueue, workflowId: uuid4() });
+    const wf = await conn.start(workflows.signalsAreAlwaysProcessed, { taskQueue, workflowId: randomUUID() });
 
     const sinks: InjectedSinks<workflows.SignalProcessTestSinks> = {
       controller: {

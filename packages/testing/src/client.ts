@@ -1,13 +1,11 @@
-import 'abort-controller/polyfill'; // eslint-disable-line import/no-unassigned-import
-import {
-  Client,
+import type {
   ClientOptions,
   Connection,
   TestService,
-  WorkflowClient,
   WorkflowClientOptions,
   WorkflowResultOptions,
 } from '@temporalio/client';
+import { Client, WorkflowClient } from '@temporalio/client';
 
 /**
  * Subset of the "normal" client options that are used to create a client for the test environment.

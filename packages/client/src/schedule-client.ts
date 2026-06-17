@@ -1,12 +1,13 @@
+import { randomUUID } from 'node:crypto';
 import { status as grpcStatus } from '@grpc/grpc-js';
-import { v4 as uuid4 } from 'uuid';
-import { Workflow } from '@temporalio/common';
+import type { Workflow } from '@temporalio/common';
 import {
   decodeSearchAttributes,
   decodeTypedSearchAttributes,
   encodeUnifiedSearchAttributes,
 } from '@temporalio/common/lib/converter/payload-search-attributes';
-import { composeInterceptors, Headers } from '@temporalio/common/lib/interceptors';
+import type { Headers } from '@temporalio/common/lib/interceptors';
+import { composeInterceptors } from '@temporalio/common/lib/interceptors';
 import { encodeMapToPayloads, decodeMapFromPayloads } from '@temporalio/common/lib/internal-non-workflow';
 import { filterNullAndUndefined } from '@temporalio/common/lib/internal-workflow';
 import { temporal } from '@temporalio/proto';
@@ -18,22 +19,20 @@ import {
   tsToDate,
 } from '@temporalio/common/lib/time';
 import { SymbolBasedInstanceOfError } from '@temporalio/common/lib/type-helpers';
-import { CreateScheduleInput, CreateScheduleOutput, ScheduleClientInterceptor } from './interceptors';
-import { WorkflowService } from './types';
+import type { CreateScheduleInput, CreateScheduleOutput, ScheduleClientInterceptor } from './interceptors';
+import type { WorkflowService } from './types';
 import { isGrpcServiceError, ServiceError } from './errors';
-import {
+import type {
   Backfill,
   CompiledScheduleUpdateOptions,
   ScheduleSummary,
   ScheduleDescription,
   ScheduleOptions,
-  ScheduleOverlapPolicy,
   ScheduleUpdateOptions,
   ScheduleOptionsAction,
   ScheduleOptionsStartWorkflowAction,
-  encodeScheduleOverlapPolicy,
-  decodeScheduleOverlapPolicy,
 } from './schedule-types';
+import { ScheduleOverlapPolicy, encodeScheduleOverlapPolicy, decodeScheduleOverlapPolicy } from './schedule-types';
 import {
   compileScheduleOptions,
   compileUpdatedScheduleOptions,
@@ -46,13 +45,8 @@ import {
   encodeScheduleSpec,
   encodeScheduleState,
 } from './schedule-helpers';
-import {
-  BaseClient,
-  BaseClientOptions,
-  defaultBaseClientOptions,
-  LoadedWithDefaults,
-  WithDefaults,
-} from './base-client';
+import type { BaseClientOptions, LoadedWithDefaults, WithDefaults } from './base-client';
+import { BaseClient, defaultBaseClientOptions } from './base-client';
 import { rethrowKnownErrorTypes } from './helpers';
 
 /**
@@ -230,19 +224,19 @@ export class ScheduleClient extends BaseClient {
     const req: temporal.api.workflowservice.v1.ICreateScheduleRequest = {
       namespace: this.options.namespace,
       identity,
-      requestId: uuid4(),
+      requestId: randomUUID(),
       scheduleId: opts.scheduleId,
       schedule: {
         spec: encodeScheduleSpec(opts.spec),
-        action: await encodeScheduleAction(this.dataConverter, opts.action, headers),
+        action: await encodeScheduleAction(this.dataConverter, this.options.namespace, opts.action, headers),
         policies: encodeSchedulePolicies(opts.policies),
         state: encodeScheduleState(opts.state),
       },
       memo: opts.memo ? { fields: await encodeMapToPayloads(this.dataConverter, opts.memo) } : undefined,
       searchAttributes:
-        opts.searchAttributes || opts.typedSearchAttributes // eslint-disable-line @typescript-eslint/no-deprecated
+        opts.searchAttributes || opts.typedSearchAttributes
           ? {
-              indexedFields: encodeUnifiedSearchAttributes(opts.searchAttributes, opts.typedSearchAttributes), // eslint-disable-line @typescript-eslint/no-deprecated
+              indexedFields: encodeUnifiedSearchAttributes(opts.searchAttributes, opts.typedSearchAttributes),
             }
           : undefined,
       initialPatch: {
@@ -298,16 +292,16 @@ export class ScheduleClient extends BaseClient {
       scheduleId,
       schedule: {
         spec: encodeScheduleSpec(opts.spec),
-        action: await encodeScheduleAction(this.dataConverter, opts.action, header),
+        action: await encodeScheduleAction(this.dataConverter, this.options.namespace, opts.action, header),
         policies: encodeSchedulePolicies(opts.policies),
         state: encodeScheduleState(opts.state),
       },
       identity: this.options.identity,
-      requestId: uuid4(),
+      requestId: randomUUID(),
       searchAttributes:
-        opts.searchAttributes || opts.typedSearchAttributes // eslint-disable-line @typescript-eslint/no-deprecated
+        opts.searchAttributes || opts.typedSearchAttributes
           ? {
-              indexedFields: encodeUnifiedSearchAttributes(opts.searchAttributes, opts.typedSearchAttributes), // eslint-disable-line @typescript-eslint/no-deprecated
+              indexedFields: encodeUnifiedSearchAttributes(opts.searchAttributes, opts.typedSearchAttributes),
             }
           : undefined,
     };
@@ -330,7 +324,7 @@ export class ScheduleClient extends BaseClient {
         namespace: this.options.namespace,
         scheduleId,
         identity: this.options.identity,
-        requestId: uuid4(),
+        requestId: randomUUID(),
         patch,
       });
     } catch (err: any) {
@@ -432,7 +426,11 @@ export class ScheduleClient extends BaseClient {
         return {
           scheduleId,
           spec: decodeScheduleSpec(raw.schedule.spec),
-          action: await decodeScheduleAction(this.client.dataConverter, raw.schedule.action),
+          action: await decodeScheduleAction(
+            this.client.dataConverter,
+            this.client.options.namespace,
+            raw.schedule.action
+          ),
           memo: await decodeMapFromPayloads(this.client.dataConverter, raw.memo?.fields),
           searchAttributes: decodeSearchAttributes(raw.searchAttributes?.indexedFields),
           typedSearchAttributes: decodeTypedSearchAttributes(raw.searchAttributes?.indexedFields),

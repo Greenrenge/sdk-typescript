@@ -1,28 +1,32 @@
 packages:
   - packages/activity
-  - packages/ai-sdk
   - packages/client
   - packages/cloud
   - packages/common
   - packages/core-bridge
   - packages/create-project
   - packages/envconfig
-  - packages/interceptors-opentelemetry
+  - packages/lambda-worker
   - packages/meta
   - packages/nexus
   - packages/nyc-test-coverage
   - packages/plugin
   - packages/proto
   - packages/test
+  - packages/test-helpers
   - packages/testing
   - packages/worker
   - packages/workflow
+  - contrib/ai-sdk
+  - contrib/interceptors-opentelemetry
+  - contrib/openai-agents
+  - contrib/workflow-streams
   - scripts
 
 ignoreScripts: true
 
-# Minimum release age, in minutes (1 day)
-minimumReleaseAge: 1440
+# Minimum release age, in minutes (2 weeks)
+minimumReleaseAge: 20160
 
 # Allow depending on just published Temporal packages
 minimumReleaseAgeExclude:
@@ -36,10 +40,9 @@ peerDependencyRules:
     - quill-delta
 
 overrides:
-  # Can be removed once a release of `express` with an updated qs is cut
-  qs: ^6.14.1
-
-  jws@<3.2.3: '>=3.2.3'
-  tar: '>=7.5.10'
   'minimatch@>=7.0.0 <7.4.8': '>=7.4.8'
   serialize-javascript: '>=7.0.3'
+  handlebars: '>=4.7.9'
+
+patchedDependencies:
+  protobufjs@7.5.8: patches/protobufjs@7.5.8.patch
